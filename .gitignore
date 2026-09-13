@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime artefacts. The Watcher writes traces, session storage and a sandbox
+# runtime tree; none of it belongs in version control.
+traces/
+*.trace.json
+.watcher/
+*.log
+
+# Editors and OS junk
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Deliberately NOT ignored:
+#   benchmark-results.json, benchmark-v3-results.json
+#       measured results are part of the research record
+#   diagnostics/
+#       documents the platform findings the enforcement layer depends on

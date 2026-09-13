@@ -1,0 +1,22 @@
+# Line endings are normalised in the repository, and the ones that must not
+# change are pinned.
+#
+# This matters more than usual here: V3 runs on Linux and is commonly driven
+# from WSL against a Windows working copy. A shell script checked out with CRLF
+# fails there with "bad interpreter: No such file or directory", which is a
+# confusing way to lose an afternoon.
+
+* text=auto
+
+# Scripts and source: always LF, so the same checkout works on every platform.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.cfg  text eol=lf
+
+# Assets: never rewrite these.
+*.png binary
+*.jpg binary
+*.ico binary

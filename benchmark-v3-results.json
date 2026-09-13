@@ -1,0 +1,184 @@
+{
+  "available_backends": [
+    "namespaces"
+  ],
+  "contained_only": {
+    "escape": {
+      "attempts": 9,
+      "containment_empty_after": true,
+      "containment_verified": true,
+      "escape_count": 0,
+      "escaped": [],
+      "exit_code": 0,
+      "note": "not run unenforced: destructive on an unprotected host",
+      "wall_ms": 944.888
+    },
+    "process": {
+      "attempts": 3,
+      "containment_empty_after": true,
+      "containment_verified": true,
+      "escape_count": 0,
+      "escaped": [],
+      "exit_code": 0,
+      "note": "not run unenforced: destructive on an unprotected host",
+      "wall_ms": 995.988
+    },
+    "root": {
+      "attempts": 10,
+      "containment_empty_after": true,
+      "containment_verified": true,
+      "escape_count": 0,
+      "escaped": [],
+      "exit_code": 0,
+      "note": "not run unenforced: destructive on an unprotected host",
+      "wall_ms": 979.455
+    },
+    "syscall": {
+      "attempts": 16,
+      "containment_empty_after": true,
+      "containment_verified": true,
+      "escape_count": 0,
+      "escaped": [],
+      "exit_code": 0,
+      "note": "not run unenforced: destructive on an unprotected host",
+      "wall_ms": 1000.796
+    }
+  },
+  "enforcement_available": true,
+  "generated_at": 1789254362,
+  "kernel": "6.6.87.2-microsoft-standard-WSL2",
+  "kill_latency": {
+    "isolate_and_terminate": {
+      "count": 6,
+      "max_ms": 172.8726,
+      "mean_ms": 171.2524,
+      "median_ms": 171.4846,
+      "min_ms": 169.7499,
+      "p95_ms": 172.8726
+    },
+    "iterations": 6,
+    "survivors": [],
+    "verification_failures": 0,
+    "verified_empty": 6
+  },
+  "landlock_abi": 3,
+  "lifecycle": {
+    "inspect": {
+      "count": 12,
+      "max_ms": 3.0891,
+      "mean_ms": 2.1004,
+      "median_ms": 2.2533,
+      "min_ms": 1.3688,
+      "p95_ms": 2.5788
+    },
+    "iterations": 12,
+    "launch": {
+      "count": 12,
+      "max_ms": 730.2306,
+      "mean_ms": 375.7307,
+      "median_ms": 312.666,
+      "min_ms": 172.2723,
+      "p95_ms": 635.3525
+    },
+    "prepare": {
+      "count": 12,
+      "max_ms": 114.0705,
+      "mean_ms": 10.0262,
+      "median_ms": 0.5842,
+      "min_ms": 0.3762,
+      "p95_ms": 0.7424
+    },
+    "terminate": {
+      "count": 12,
+      "max_ms": 219.3311,
+      "mean_ms": 179.3346,
+      "median_ms": 174.8587,
+      "min_ms": 169.8515,
+      "p95_ms": 185.6719
+    },
+    "total_median_ms": 488.1089
+  },
+  "mode_comparison": {
+    "file": {
+      "overhead_ms": 822.614,
+      "overhead_ratio": 7.058,
+      "v2": {
+        "enforced": null,
+        "escape_count": 3,
+        "escaped": [
+          "list_root",
+          "list_root_via_fd",
+          "read_mnt_c"
+        ],
+        "exit_code": 3,
+        "wall_ms": 135.788
+      },
+      "v3": {
+        "backend": "namespaces",
+        "containment_empty_after": true,
+        "containment_verified": true,
+        "enforced": true,
+        "escape_count": 0,
+        "escaped": [],
+        "exit_code": 0,
+        "profile_digest": "19fccdd57a351d935ea4bb28fafffea3964b00b4db85463a672000cef5e42fe5",
+        "wall_ms": 958.402
+      }
+    },
+    "network": {
+      "overhead_ms": -967.539,
+      "overhead_ratio": 0.502,
+      "v2": {
+        "enforced": null,
+        "escape_count": 5,
+        "escaped": [
+          "connect_dns",
+          "connect_gateway",
+          "connect_ipv4",
+          "resolve_dns",
+          "udp_sendto"
+        ],
+        "exit_code": 3,
+        "wall_ms": 1942.807
+      },
+      "v3": {
+        "backend": "namespaces",
+        "containment_empty_after": true,
+        "containment_verified": true,
+        "enforced": true,
+        "escape_count": 0,
+        "escaped": [],
+        "exit_code": 0,
+        "profile_digest": "19fccdd57a351d935ea4bb28fafffea3964b00b4db85463a672000cef5e42fe5",
+        "wall_ms": 975.268
+      }
+    },
+    "workspace": {
+      "overhead_ms": 794.077,
+      "overhead_ratio": 5.894,
+      "v2": {
+        "enforced": null,
+        "escape_count": 0,
+        "escaped": [],
+        "exit_code": 0,
+        "wall_ms": 162.242
+      },
+      "v3": {
+        "backend": "namespaces",
+        "containment_empty_after": true,
+        "containment_verified": true,
+        "enforced": true,
+        "escape_count": 0,
+        "escaped": [],
+        "exit_code": 0,
+        "profile_digest": "19fccdd57a351d935ea4bb28fafffea3964b00b4db85463a672000cef5e42fe5",
+        "wall_ms": 956.319
+      }
+    }
+  },
+  "platform": "linux",
+  "python": "3.12.3",
+  "quick": false,
+  "seccomp_available": true,
+  "workspace_root": "/tmp/watcher-v3-benchmark-u7uexiss"
+}

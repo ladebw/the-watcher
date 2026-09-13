@@ -1,0 +1,86 @@
+{
+  "canonical_hash": {
+    "count": 50000,
+    "max_ms": 299.8516,
+    "mean_ms": 0.0881,
+    "median_ms": 0.046,
+    "min_ms": 0.0227,
+    "p95_ms": 0.0977,
+    "p99_ms": 0.48
+  },
+  "generated_at": 1789220486,
+  "ipc_roundtrip": {
+    "count": 1000,
+    "max_ms": 42.9376,
+    "mean_ms": 1.1224,
+    "median_ms": 0.7571,
+    "min_ms": 0.5474,
+    "p95_ms": 1.3961,
+    "p99_ms": 8.0778
+  },
+  "kill_latency": {
+    "count": 3,
+    "max_ms": 283.4829,
+    "mean_ms": 278.8091,
+    "median_ms": 282.6015,
+    "min_ms": 270.3429,
+    "p95_ms": 283.4829,
+    "p99_ms": 283.4829
+  },
+  "platform": "win32",
+  "poe_append": {
+    "chain_valid": true,
+    "count": 10000,
+    "final_hash": "df7322498d549c5d8da148c25e1aa3d557644cef81eb8497a81434a8e7570c8f",
+    "max_ms": 35.5128,
+    "mean_ms": 0.1258,
+    "median_ms": 0.0957,
+    "min_ms": 0.0491,
+    "p95_ms": 0.1571,
+    "p99_ms": 0.6803
+  },
+  "policy_evaluation": {
+    "count": 20000,
+    "max_ms": 13.9356,
+    "mean_ms": 0.0454,
+    "median_ms": 0.0329,
+    "min_ms": 0.0046,
+    "p95_ms": 0.0862,
+    "p99_ms": 0.1756
+  },
+  "python": "3.14.3",
+  "quick": false,
+  "scales": {
+    "concurrent_per_thread": 250,
+    "concurrent_threads": 4,
+    "hash_iterations": 50000,
+    "ipc_iterations": 1000,
+    "kill_sessions": 3,
+    "poe_iterations": 10000,
+    "policy_iterations": 20000,
+    "throughput_iterations": 2000
+  },
+  "throughput_concurrent": {
+    "chain_valid": true,
+    "count": 1000,
+    "errors": 0,
+    "events_per_second": 946.3,
+    "max_ms": 18.1044,
+    "mean_ms": 4.1373,
+    "median_ms": 4.0545,
+    "min_ms": 0.7721,
+    "p95_ms": 6.5455,
+    "p99_ms": 8.2188,
+    "requests": 1000,
+    "seconds": 1.0567,
+    "sequence_is_dense": true,
+    "threads": 4,
+    "unique_event_hashes": true
+  },
+  "throughput_sequential": {
+    "events": 2000,
+    "events_per_second": 1042.1,
+    "mean_ms_per_event": 0.9596,
+    "seconds": 1.9191
+  }
+}
