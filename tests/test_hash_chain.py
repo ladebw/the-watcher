@@ -143,10 +143,16 @@ def test_seal_freezes_the_declared_hash(clock):
 
 
 def test_exported_final_hash_uses_the_sealed_value(clock):
+    """The export reports the sealed hash, so post-seal edits stay visible."""
     trace = build_trace(clock, count=3)
     trace.seal()
     declared = trace.declared_final_hash
-    trace.add("file_access", "read", "/workspace/after-seal.txt")
+
+    # A sealed trace now refuses appends, so the cheap post-seal tamper is a
+    # deletion. Either way the exported hash must remain the sealed one, which
+    # is what makes the edit detectable at all.
+    trace.events.pop()
+
     assert trace.to_dict()["final_hash"] == declared
 
 

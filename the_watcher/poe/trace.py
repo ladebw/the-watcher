@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterator, Mapping
 
-from ..exceptions import TraceError
+from ..exceptions import TraceError, TraceSealedError
 from .canonical import GENESIS_HASH, canonical_bytes, sha256_hex
 from .event import EventType, PoEEvent, as_text, coerce_event_type
 
@@ -64,7 +64,20 @@ class ExecutionTrace:
 
         The caller's ``sequence``, ``previous_hash`` and ``event_hash`` are
         overwritten: chain integrity is the trace's responsibility.
+
+        Sealing is a one-way door. A sealed trace has a declared final hash
+        that covers the event count and the head hash, so an append afterwards
+        would leave verification reporting ``INVALID_FINAL_TRACE_HASH`` for a
+        trace nobody tampered with. Refusing the append keeps the invariant
+        "sealed means no further event may be appended" true by construction
+        rather than by every caller remembering it.
         """
+        if self.declared_final_hash is not None:
+            raise TraceSealedError(
+                f"trace for session {self.session_id} is sealed; "
+                f"refusing to append {len(self.events)} -> {len(self.events) + 1}"
+            )
+
         chained = replace(
             event,
             sequence=len(self.events),

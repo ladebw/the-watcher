@@ -59,6 +59,10 @@ class EventType(str, enum.Enum):
     HEARTBEAT_LOST = "heartbeat_lost"
     IPC_LOST = "ipc_lost"
     IPC_VIOLATION = "ipc_violation"
+    #: IPC writers did not stop before the seal deadline. Recorded as a
+    #: critical condition, because a writer that outlives shutdown is exactly
+    #: what used to corrupt an otherwise valid trace.
+    IPC_DRAIN_TIMEOUT = "ipc_drain_timeout"
     CLIENT_FIELD_REJECTED = "client_field_rejected"
     SESSION_TIMEOUT = "session_timeout"
     TRACE_SEALED = "trace_sealed"

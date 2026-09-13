@@ -17,6 +17,7 @@ half of the trust boundary; the daemon is the *authority* half.
 
 from __future__ import annotations
 
+import enum
 import hmac
 import threading
 import time
@@ -25,7 +26,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from ..exceptions import IpcTransportError, ProtocolError
+from ..exceptions import IpcDrainTimeout, IpcTransportError, ProtocolError
 from .protocol import (
     CLIENT_MESSAGE_TYPES,
     ErrorCode,
@@ -37,7 +38,46 @@ from .protocol import (
 )
 from .transport import IpcConnection, IpcListener, LocalEndpoint
 
-__all__ = ["ClientContext", "IpcServer"]
+__all__ = ["ClientContext", "DrainOutcome", "IpcServer", "ServerState"]
+
+#: How long :meth:`IpcServer.drain` waits for authoritative writers by default.
+#: Bounded on purpose: a wedged worker must not be able to hang the Watcher.
+DEFAULT_DRAIN_TIMEOUT = 5.0
+
+
+class ServerState(str, enum.Enum):
+    """Lifecycle of the IPC transport.
+
+    ``RUNNING`` accepts work. ``DRAINING`` refuses to start a new handler but
+    lets the ones already in flight finish. ``STOPPED`` means every worker is
+    gone and no further authoritative write can occur.
+    """
+
+    NEW = "NEW"
+    RUNNING = "RUNNING"
+    DRAINING = "DRAINING"
+    STOPPED = "STOPPED"
+
+
+@dataclass(frozen=True)
+class DrainOutcome:
+    """What happened when the authoritative writers were drained."""
+
+    drained: bool
+    forced: bool
+    active_writers: int
+    remaining_workers: tuple[str, ...]
+    elapsed: float
+
+    def describe(self) -> str:
+        if self.drained:
+            return f"all IPC writers stopped in {self.elapsed:.3f}s"
+        return (
+            f"IPC drain timed out after {self.elapsed:.3f}s with "
+            f"{self.active_writers} writer(s) mid-append and "
+            f"{len(self.remaining_workers)} worker(s) alive: "
+            f"{', '.join(self.remaining_workers) or 'none named'}"
+        )
 
 #: Handshake fields that are safe to copy into the audit trail.  Anything else
 #: a client sends about itself is discarded: unvalidated client strings would
@@ -116,6 +156,13 @@ class IpcServer:
 
         self._stopping = threading.Event()
         self._threads_lock = threading.Lock()
+        #: Guards the authoritative-writer count. Shares the thread lock so a
+        #: state change and a writer claim cannot interleave.
+        self._writers_cv = threading.Condition(self._threads_lock)
+        self._state = ServerState.NEW
+        #: Handlers currently inside ``dispatch``. Non-zero means an event may
+        #: still be appended, so sealing is not yet safe.
+        self._writers = 0
         self._connections: dict[str, IpcConnection] = {}
         self._contexts: dict[str, ClientContext] = {}
         self._accept_thread: "threading.Thread | None" = None
@@ -143,8 +190,18 @@ class IpcServer:
         return self._limits
 
     @property
+    def state(self) -> ServerState:
+        return self._state
+
+    @property
     def running(self) -> bool:
-        return self._started and not self._stopping.is_set()
+        return self._state is ServerState.RUNNING
+
+    @property
+    def active_writers(self) -> int:
+        """Handlers currently mid-append. Must be zero before sealing."""
+        with self._writers_cv:
+            return self._writers
 
     @property
     def connection_count(self) -> int:
@@ -175,20 +232,19 @@ class IpcServer:
         if self._started:
             return self
         self._started = True
+        self._state = ServerState.RUNNING
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="watcher-ipc-accept", daemon=True
         )
         self._accept_thread.start()
         return self
 
-    def stop(self, timeout: float = 2.0) -> None:
-        """Stop accepting, drop clients and release the endpoint."""
-        if self._stopping.is_set():
-            return
-        self._stopping.set()
+    def _wake_accept(self) -> None:
+        """Unblock a pending ``accept()``.
 
-        # Unblock a pending accept() deterministically: on Windows the accept
-        # call has no timeout, so we wake it with a throwaway connection.
+        On Windows ``accept`` has no timeout, so the portable way to wake it is
+        a throwaway connection.
+        """
         try:
             from .transport import connect as _connect
 
@@ -197,25 +253,62 @@ class IpcServer:
         except Exception:  # noqa: BLE001 - best effort, never fatal
             pass
 
-        thread = self._accept_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout)
+    def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> DrainOutcome:
+        """Stop accepting work and wait for every authoritative writer to go.
 
-        with self._threads_lock:
+        The sequence is the point of the method:
+
+        1. move to ``DRAINING`` under the writer condition, so no *new* handler
+           can start and therefore no new append can begin;
+        2. wake and join the accept loop, so no new connection can arrive;
+        3. close the accepted transports, which unblocks a worker parked in a
+           read;
+        4. wait for the workers to exit — their teardown is what records
+           ``client_disconnected``, and a live worker could still be doing it;
+        5. wait for the in-flight writer count to reach zero.
+
+        Steps 4 and 5 are both required: a worker can be alive without writing,
+        and a writer can be mid-append on a worker that is about to exit. Only
+        when both are clear is it safe to seal the trace.
+
+        Bounded and non-raising: an unclean drain is reported through
+        :class:`DrainOutcome` so that :meth:`stop` can turn it into an explicit
+        failure and the supervisor can decide what to record. A wedge is never
+        allowed to hang the Watcher.
+        """
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout)
+
+        with self._writers_cv:
+            if self._state is ServerState.STOPPED:
+                return DrainOutcome(True, False, 0, (), 0.0)
+            self._state = ServerState.DRAINING
+            self._stopping.set()
             connections = list(self._connections.values())
             self._connections.clear()
+
+        self._wake_accept()
+
+        accept_thread = self._accept_thread
+        if accept_thread is not None and accept_thread.is_alive():
+            accept_thread.join(max(0.0, min(timeout, 2.0)))
+
+        # Only the accept loop registers workers, so once it has stopped the
+        # set below is final.
+        with self._writers_cv:
             workers = list(self._workers)
             self._workers.clear()
+            connections.extend(self._connections.values())
+            self._connections.clear()
 
         for connection in connections:
-            connection.close()
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001
+                pass
 
-        # Wait for connection threads to finish. This matters for correctness:
-        # a worker records lifecycle events (client_disconnected), and the
-        # daemon must be sure no further event can be appended before it seals
-        # the trace. Without this join, a late worker could append after the
-        # seal and invalidate the declared final hash.
-        deadline = time.monotonic() + max(0.0, timeout)
+        # Join outside the condition: _end_write() needs the same lock to
+        # decrement the writer count, so holding it here would deadlock.
         for worker in workers:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -223,7 +316,69 @@ class IpcServer:
             if worker.is_alive():
                 worker.join(remaining)
 
-        self._listener.close()
+        with self._writers_cv:
+            while self._writers > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._writers_cv.wait(min(remaining, 0.25))
+            active = self._writers
+
+        remaining_workers = tuple(w.name for w in workers if w.is_alive())
+        drained = active == 0 and not remaining_workers
+        forced = False
+
+        if not drained:
+            # Force the transports shut so a wedged worker cannot hold the
+            # session open. This is not what keeps the trace sound — the
+            # sealed-append guard in the PoE layer is — but it bounds the
+            # damage and gets the worker to exit.
+            forced = True
+            for connection in connections:
+                try:
+                    connection.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            grace = min(0.5, max(0.0, deadline - time.monotonic()))
+            if grace > 0:
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.join(grace)
+
+        try:
+            self._listener.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        with self._writers_cv:
+            active = self._writers
+            remaining_workers = tuple(w.name for w in workers if w.is_alive())
+            drained = active == 0 and not remaining_workers
+            if drained:
+                self._state = ServerState.STOPPED
+
+        return DrainOutcome(
+            drained=drained,
+            forced=forced,
+            active_writers=active,
+            remaining_workers=remaining_workers,
+            elapsed=time.monotonic() - started,
+        )
+
+    def stop(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> DrainOutcome:
+        """Drain, and refuse to pretend a dirty shutdown was a clean one.
+
+        Raises :class:`IpcDrainTimeout` when a writer is still active past the
+        deadline. Returning quietly would let the caller proceed to seal a
+        trace that a worker could still be appending to.
+        """
+        outcome = self.drain(timeout)
+        if not outcome.drained:
+            raise IpcDrainTimeout(
+                f"IPC drain did not complete: {outcome.describe()}",
+                list(outcome.remaining_workers),
+            )
+        return outcome
 
     # -- accept loop -----------------------------------------------------
 
@@ -445,6 +600,22 @@ class IpcServer:
             return
 
         payload = message.get("payload") or {}
+        if not self._begin_write():
+            # Draining. Refusing here is what guarantees that no *new*
+            # authoritative write can start once shutdown has begun.
+            try:
+                connection.send(
+                    build_error(
+                        request_id,
+                        ErrorCode.NOT_READY,
+                        "server is shutting down",
+                    ),
+                    self._limits,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         try:
             result = self._handler.dispatch(message_type, payload, context)
         except ProtocolError as exc:
@@ -462,12 +633,33 @@ class IpcServer:
                 self._limits,
             )
             return
+        finally:
+            self._end_write()
 
         context.requests_served += 1
         connection.send(
             build_response(request_id, result if isinstance(result, Mapping) else {}),
             self._limits,
         )
+
+    def _begin_write(self) -> bool:
+        """Claim the right to run one authoritative handler, or refuse.
+
+        Returns ``False`` once the server is draining. Counting writers — as
+        opposed to inferring safety from thread liveness — is what makes
+        "no active authoritative writer before seal" a property the shutdown
+        can actually check.
+        """
+        with self._writers_cv:
+            if self._state is not ServerState.RUNNING:
+                return False
+            self._writers += 1
+            return True
+
+    def _end_write(self) -> None:
+        with self._writers_cv:
+            self._writers -= 1
+            self._writers_cv.notify_all()
 
     def _remember_request(self, context: ClientContext, request_id: "str | None") -> bool:
         """Return ``False`` for a replayed request id."""

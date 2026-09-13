@@ -7,7 +7,7 @@ import dataclasses
 import pytest
 
 from the_watcher import ExecutionTrace, Recorder, TraceVerifier
-from the_watcher.exceptions import TraceVerificationError
+from the_watcher.exceptions import TraceSealedError, TraceVerificationError
 from the_watcher.poe import TamperSignal
 
 SIGNAL_PREFIXES = {signal.value for signal in TamperSignal}
@@ -221,12 +221,25 @@ def test_invalid_genesis_link_is_detected(clock):
 
 
 def test_appending_after_sealing_invalidates_the_final_hash(clock):
-    trace = build_trace(clock, count=3, seal=True)
-    trace.add("file_access", "read", "/workspace/sneaky.txt")
+    """A sealed trace refuses the append outright.
 
-    result = trace.verify()
-    assert not result.valid
-    assert has_signal(result, "INVALID_FINAL_TRACE_HASH")
+    Letting the append through used to leave ``compute_final_hash()``
+    different from ``declared_final_hash``, so verification reported
+    INVALID_FINAL_TRACE_HASH on a trace nobody had tampered with. Refusing it
+    removes the whole class of false verdict, and the trace stays valid.
+    """
+    trace = build_trace(clock, count=3, seal=True)
+    declared = trace.declared_final_hash
+    count = len(trace.events)
+
+    with pytest.raises(TraceSealedError):
+        trace.add("file_access", "read", "/workspace/sneaky.txt")
+
+    # The refusal changed nothing...
+    assert len(trace.events) == count
+    assert trace.declared_final_hash == declared
+    # ...so the trace still verifies, and truncation is still detectable.
+    assert trace.verify().valid
 
 
 def test_invalid_event_hash_format_is_detected(clock):

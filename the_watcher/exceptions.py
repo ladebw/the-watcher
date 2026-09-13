@@ -11,6 +11,7 @@ __all__ = [
     "CanonicalizationError",
     "TraceError",
     "TraceVerificationError",
+    "TraceSealedError",
     "PolicyError",
     "TripwireViolation",
     "SessionError",
@@ -21,6 +22,7 @@ __all__ = [
     "StorageError",
     "IpcError",
     "IpcTransportError",
+    "IpcDrainTimeout",
     "AuthenticationError",
     "ProtocolError",
     "EnforcementError",
@@ -50,6 +52,17 @@ class TraceVerificationError(TraceError):
     def __init__(self, message: str, signals: "list[str] | None" = None) -> None:
         super().__init__(message)
         self.signals = list(signals or [])
+
+
+class TraceSealedError(TraceError):
+    """An event was appended to a trace that has already been sealed.
+
+    Sealing fixes the declared final hash, which is what makes later
+    truncation detectable. Letting an append through after that point would
+    silently change the event count and head hash, so verification would
+    report ``INVALID_FINAL_TRACE_HASH`` on a trace nobody tampered with. The
+    append is therefore refused outright rather than recorded and regretted.
+    """
 
 
 class PolicyError(WatcherError):
@@ -99,6 +112,22 @@ class IpcError(WatcherError):
 
 class IpcTransportError(IpcError):
     """The local IPC transport failed, closed or timed out."""
+
+
+class IpcDrainTimeout(IpcError):
+    """IPC workers did not stop within the shutdown deadline.
+
+    Raised instead of returning quietly, because the supervisor must not seal
+    the trace while an authoritative writer could still append to it. A caller
+    that sees this must treat the session as having failed to shut down
+    cleanly, not as having stopped normally.
+    """
+
+    def __init__(
+        self, message: str, remaining: "list[str] | None" = None
+    ) -> None:
+        super().__init__(message)
+        self.remaining = list(remaining or [])
 
 
 class AuthenticationError(IpcError):

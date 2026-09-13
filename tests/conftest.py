@@ -169,6 +169,22 @@ class DaemonHarness:
             timeout=timeout,
         )
 
+    def wait_for_client_authentication(self, timeout: float = 20.0) -> bool:
+        """Wait until a client has actually authenticated over IPC.
+
+        Readiness is not authentication. The heartbeat clock starts at
+        authentication and the session timeout is measured from process spawn,
+        so a heartbeat test that did not wait for this would be racing the
+        session timeout against the child's startup cost and would pass or fail
+        according to machine speed. Waiting on the recorded event makes the
+        precondition observable instead of assumed.
+        """
+        return wait_for(
+            lambda: self.daemon.prepared
+            and bool(self.events_of("client_authenticated")),
+            timeout=timeout,
+        )
+
     def event_types(self) -> list[str]:
         return [event.event_type for event in self.daemon.trace]
 

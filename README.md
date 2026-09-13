@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/ladebw/the-watcher/actions/workflows/ci.yml"><img src="https://github.com/ladebw/the-watcher/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/runtime%20dependencies-0-brightgreen" alt="Zero runtime dependencies">
@@ -277,7 +278,7 @@ against an attacker who owns the storage.
 
 ### Validation
 
-* **pytest** — 438 tests passing on Windows, more on Linux where the V3 suite runs
+* **pytest** — 453 tests passing on Windows, more on Linux where the V3 suite runs
 * **Ruff** — lint, clean
 
 ### Optional backend
@@ -614,10 +615,13 @@ Platform and implementation limits, stated plainly:
   `connect()` to an `AF_UNIX` socket requires write permission. The workload can
   delete it and break its own control channel; it cannot impersonate the
   supervisor.
-* **Two V2 tests are timing-flaky on WSL under load** — a concurrency test and a
-  heartbeat test, failing in roughly one run in five, with different tests
-  failing each time. Both pass in isolation. This is recorded rather than
-  papered over; see [Development Notes](#development-notes).
+* **Two PoE defects were found and fixed while preparing CI** — one stamped
+  event timestamps outside the lock that orders appends, the other let a late
+  `stop()` append after the trace had been sealed. Both made a valid, untampered
+  trace verify as **tampered**: `TIMESTAMP_REGRESSION` and
+  `INVALID_FINAL_TRACE_HASH` respectively. A sealed trace now refuses further
+  appends outright, and both have deterministic regression tests. See
+  [Development Notes](#development-notes).
 
 ---
 
@@ -677,8 +681,8 @@ Current status:
 
 | Platform | Result |
 | --- | --- |
-| Windows (Python 3.14) | **441 passed, 61 skipped** |
-| Linux / WSL2 (Python 3.12) | **500 passed, 2 skipped** |
+| Windows (Python 3.14) | **453 passed, 61 skipped** |
+| Linux / WSL2 (Python 3.12) | **512 passed, 2 skipped** |
 
 On Windows the V3 suite skips, and says why rather than passing silently:
 
@@ -687,12 +691,11 @@ V3 OS-enforced containment requires Linux with user namespaces and seccomp;
 this is win32. V2 external supervision remains available here.
 ```
 
-On Linux the same suite runs in full. Two V2 timing tests are flaky under load:
-in roughly one run in five the result is **1–2 failures** in
-`test_v2_concurrency.py` or the heartbeat tests in `test_v2_end_to_end.py`, and
-which one fails varies between runs. The assertions are correct — a heartbeat
-that stops *should* be detected — so they have not been weakened; see
-[Limitations](#limitations) and [Development Notes](#development-notes).
+The suite is green on both platforms. Two PoE defects and one test-side timing
+budget were found while preparing CI and are now fixed, each with a regression
+test; see [Limitations](#limitations) and
+[Development Notes](#development-notes). No retry and no `continue-on-error` is
+used anywhere, so an intermittent failure shows up as a red run.
 
 To run the full suite including the Linux-only containment tests:
 
@@ -700,6 +703,14 @@ To run the full suite including the Linux-only containment tests:
 bash diagnostics/run_tests_linux.sh
 bash diagnostics/final_check.sh      # tests, doctor, containment, refusal, V2
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same commands on GitHub-hosted runners:
+a quality job that lints and runs the hygiene and secret scans, a test job across
+Linux and Windows on Python 3.10, 3.12 and 3.14, and a Linux job for the V3
+containment tests. The V3 job **fails closed**: if the runner cannot enforce
+containment, `doctor` fails the job rather than letting it pass without having
+exercised anything. There are **no retries and no `continue-on-error`**, so an
+intermittent failure shows up as a red run rather than being smoothed over.
 
 The suite covers:
 
@@ -800,20 +811,72 @@ Known open work:
   allow-listing possible
 * an egress allow-list, to make `network=restricted` real
 * anchoring the sealed trace hash externally, to close the full-rewrite gap
-* a deterministic fix for the two flaky V2 timing tests
 * verification of the Docker backend on a host that has Docker
 
 ---
 
 ## Development Notes
 
-**Why two tests are flaky on WSL.** `test_v2_end_to_end.py`'s heartbeat test and
-`test_v2_concurrency.py` are timing-sensitive and fail in roughly one run in
-five under load, with a different test failing each time. They pass in isolation
-and were never observed failing on Windows. The assertions are correct — a
-heartbeat that stops *should* be detected — so they have not been weakened. A
-proper fix probably needs an explicit "the client is gone" probe rather than a
-timer, and it is listed as open work above rather than papered over.
+**Two PoE defects found while preparing CI, both fixed.** `test_v2_concurrency.py`
+and `test_child_processes_are_terminated_with_the_tree` failed intermittently —
+roughly one run in five under load, on Linux and on Windows. They were written
+off as "timing flakes" at first, which was wrong: the tests were right and the
+PoE was not. Both are fixed, each with a regression test.
+
+* **Non-monotonic timestamps.** `Recorder.record()` stamped
+  `timestamp=int(self._clock())` *before* taking the lock that orders appends,
+  so two threads straddling a whole-second boundary could be appended in the
+  opposite order to the one they were stamped in. The hash chain stayed intact
+  while verification reported `TIMESTAMP_REGRESSION` — a false tamper verdict on
+  a legitimate trace. The timestamp is now taken inside the same critical
+  section that assigns the sequence number, so sequence, timestamp and chain
+  link all derive from one serialised append. Reproduced deterministically
+  against `Recorder` alone; the regression test fails on the old code.
+
+* **Writes after the seal.** `WatcherDaemon.stop()` and `_finalize()` were not
+  mutually exclusive. `stop()` tested `_finalised` without synchronisation, so
+  it could pass that test and then append a `kill_switch` event while the daemon
+  thread was sealing the trace. The append landed after the seal, changing the
+  event count and head hash, so `compute_final_hash()` no longer matched
+  `declared_final_hash` and verification reported `INVALID_FINAL_TRACE_HASH` on
+  an untampered trace. Finalisation now claims the daemon lock before doing
+  anything else and sets a shutdown flag there; `stop()` checks that flag under
+  the same lock. A kill therefore either lands before finalisation begins — and
+  is part of the sealed trace — or is skipped entirely. There is no interleaving
+  in which it lands after the seal.
+
+Three further changes came out of the same investigation:
+
+* an execution trace now **refuses** an append once sealed (`TraceSealedError`)
+  instead of accepting it and letting the declared hash drift. This is defence
+  in depth: a writer that outlived shutdown cannot alter the audit trail even if
+  every other guarantee failed.
+* `IpcServer` has an explicit `RUNNING → DRAINING → STOPPED` lifecycle and
+  counts the handlers currently inside `dispatch`. Draining refuses to *start* a
+  new authoritative write, waits for the ones in flight and for the worker
+  threads that own them, and a drain that does not finish raises
+  `IpcDrainTimeout` rather than returning quietly. This closes a separate latent
+  weakness: the join used to give up at its deadline while the comment above it
+  claimed no worker could still append.
+* the supervisor drains IPC writers before recording the final lifecycle events
+  and sealing, and verifies the sealed trace before writing it out.
+
+**One test-side timing budget was also wrong.** The heartbeat test passed only
+when the child booted, connected and authenticated in under 1.4 s
+(`session_timeout=2.0` minus `heartbeat_timeout=0.6`), because the session
+timeout is measured from process spawn while the heartbeat clock starts at IPC
+authentication. On a slower or loaded host the session timeout won and no
+`heartbeat_lost` was ever recorded. The test now waits for the recorded
+`client_authenticated` event before asserting anything, and gives the session
+timeout enough headroom that it cannot beat the heartbeat timeout, so it
+measures heartbeat behaviour rather than host speed. It also asserts the
+ordering it depends on. No assertion was weakened and no retry was added.
+
+Verification of the fixes, all with no retries: 1000 concurrent-ordering
+iterations with 0 `TIMESTAMP_REGRESSION`; 40 consecutive concurrency-suite runs
+with 0 `INVALID_FINAL_TRACE_HASH`; the heartbeat tests 20 times on Windows and 20
+times on Linux with 0 failures. Before the fixes the concurrency suite was
+failing around 1 run in 4.
 
 **One V2 defect was found and fixed during V3 validation.** `IPC_LOST` was never
 recorded when a client died without disconnecting, because the supervisor's poll

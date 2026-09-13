@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# The workflow only reads the repository. Nothing here needs a token that can
+# write, and nothing here publishes, tags or comments.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------
+  # Quality: lint, packaging contracts, and the repository's own hygiene
+  # checks. These are the cheap gates that catch a release that would be
+  # embarrassing rather than broken.
+  # ---------------------------------------------------------------------
+  quality:
+    name: Quality (lint, hygiene, packaging)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        # No cache layer: the project has zero runtime dependencies, so there
+        # is nothing worth caching and the extra machinery would be noise.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install ruff
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Packaging contracts
+        # Version agreement, the zero-dependency promise, README asset and
+        # anchor resolution, and no user-specific paths in published files.
+        run: python -m pytest tests/test_packaging.py
+
+      - name: Code hygiene
+        # Leftover debug output, stale TODOs, commented-out code, bare except.
+        run: python diagnostics/check_code_hygiene.py
+
+      - name: Text hygiene
+        # Encoding damage, tabs, trailing whitespace.
+        run: python diagnostics/check_text_hygiene.py
+
+      - name: Secret scan
+        # Advisory pattern report plus a hard failure on high-confidence
+        # credential shapes.
+        run: python diagnostics/secret_scan.py
+
+  # ---------------------------------------------------------------------
+  # Tests across the supported platforms and Python versions.
+  #
+  # The V3 containment tests need Linux with user namespaces and seccomp.
+  # Where that is unavailable they skip and state why, so this job is a real
+  # check on the platforms that can run it and an honest no-op on those that
+  # cannot. No retries, and no continue-on-error: if a test is flaky, that is
+  # a fact worth seeing.
+  # ---------------------------------------------------------------------
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.12"
+          - "3.14"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Test
+        run: python -m pytest
+
+  # ---------------------------------------------------------------------
+  # V3 containment, run separately so that Linux enforcement is visible in
+  # the checks list instead of buried in the matrix.
+  #
+  # The runner is not given any privilege it does not already have: no
+  # privileged container, no Docker socket, no sysctl changes, no sudo. If
+  # this host cannot enforce containment then `doctor` says so and this job
+  # fails, rather than passing without having exercised anything.
+  # ---------------------------------------------------------------------
+  v3-containment:
+    name: V3 containment (Linux)
+    # Pinned rather than `ubuntu-latest`. V3 depends on unprivileged user
+    # namespaces, and `ubuntu-latest` resolves to 24.04, where AppArmor can
+    # restrict them for unprivileged binaries. That would fail this job for a
+    # runner-environment reason rather than a Watcher defect, and a red check
+    # that means nothing is no better than a green one that means nothing.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Require a host that can actually contain
+        # Fail closed, deliberately. A V3 job that skips every test and still
+        # shows a green check would be decoration: it would advertise
+        # containment that was never exercised, which is the exact failure
+        # mode this project exists to avoid. `doctor` exits non-zero when it
+        # cannot enforce, so an incapable runner turns this job red on
+        # purpose rather than quietly skipping.
+        run: python -m the_watcher.cli doctor
+
+      - name: Filesystem enforcement probe
+        # Read-only: reports whether Landlock path rules are honoured here.
+        # Does not modify the host.
+        run: bash diagnostics/check_landlock_reach.sh
+
+      - name: V3 containment suites
+        # -rs prints every skip reason at the end of the run, so a skipped
+        # suite is visible in the log rather than merely implied.
+        run: |
+          python -m pytest -rs \
+            tests/test_v3_profile.py \
+            tests/test_v3_capabilities.py \
+            tests/test_v3_containment.py

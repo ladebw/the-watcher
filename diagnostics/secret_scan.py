@@ -40,6 +40,63 @@ PLACEHOLDER = re.compile(
     re.I,
 )
 
+#: Shapes that identify a *live* credential rather than a mention of one.
+#:
+#: These mirror the value patterns the trace recorder redacts with
+#: (``the_watcher/poe/redact.py``), minus the URL-userinfo rule — that masks a
+#: password rather than recognising a key. The advisory report above lists
+#: everything it can find; this list is the part that fails a build, so it is
+#: deliberately narrow. A detector that fires on documentation is a detector
+#: people learn to ignore.
+HIGH_CONFIDENCE: dict[str, re.Pattern[str]] = {
+    "openai_key": re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),
+    "github_token": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"),
+    "github_pat": re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    "aws_key_id": re.compile(r"\bA(?:KIA|SIA)[0-9A-Z]{16}\b"),
+    "google_api_key": re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}\b"),
+    "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),
+    "jwt": re.compile(
+        r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}\b"
+    ),
+    "bearer_header": re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}"),
+    # A real PEM body is long; the short placeholder in the tests does not
+    # match even before the exemption below is applied.
+    "pem_private_key": re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{64,}?-----END [A-Z ]*PRIVATE KEY-----"
+    ),
+}
+
+#: Paths whose *purpose* is to describe these shapes, plus test fixtures.
+#: Scanning them would flag the detector rather than a leak.
+HIGH_CONFIDENCE_EXEMPT: tuple[str, ...] = (
+    "tests/",
+    "the_watcher/poe/redact.py",
+    "diagnostics/secret_scan.py",
+)
+
+
+def relative(path: str) -> str:
+    return os.path.relpath(path, ".").replace(os.sep, "/")
+
+
+def scan_high_confidence() -> "list[str]":
+    """Return matches that look like a real credential, or an empty list."""
+    found: list[str] = []
+    for path in iter_files():
+        name = relative(path)
+        if name.startswith(HIGH_CONFIDENCE_EXEMPT):
+            continue
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for label, pattern in HIGH_CONFIDENCE.items():
+            for match in pattern.finditer(text):
+                line_number = text[: match.start()].count("\n") + 1
+                line = text.splitlines()[line_number - 1].strip()[:120]
+                found.append(f"{name}:{line_number}: {label}: {line}")
+    return found
+
 
 def iter_files(root: str = ".") -> "list[str]":
     found: list[str] = []
@@ -97,6 +154,21 @@ def main() -> int:
         if len(found) > 12:
             print(f"    ... {len(found) - 12} more")
         print()
+
+    critical = scan_high_confidence()
+    print("--- high-confidence credential shapes ---")
+    if critical:
+        for entry in critical:
+            print(f"    {entry}")
+        print()
+        print(
+            f"{len(critical)} match(es) look like a live credential. The advisory "
+            "list above is expected to be noisy; this one is not."
+        )
+        return 1
+    print("    none")
+    print()
+    print("no live credential shapes found")
     return 0
 
 

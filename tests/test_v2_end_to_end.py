@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 from the_watcher import Decision, Policy, Tripwire
+from the_watcher.exceptions import ProtocolError
+from the_watcher.ipc.protocol import ErrorCode
 from the_watcher.ipc.server import ClientContext
 from the_watcher.ipc.transport import create_endpoint
 from the_watcher.supervisor import SessionState, SupervisoryAction
@@ -330,11 +332,14 @@ def test_kill_state_is_irreversible(harness_factory):
 
 
 def test_protected_process_cannot_reset_kill_state_through_ipc(harness_factory):
-    """No IPC message may move a killed session back to a usable state."""
+    """No IPC message may move a killed session to a usable state."""
     harness = harness_factory("tripwire", child_env={"WATCHER_AGENT_LINGER": "1"})
     assert harness.wait(timeout=60) == 137
     daemon = harness.daemon
     context = ctx(session_id=daemon.session_id)
+
+    # The session has finished, so its authoritative trace is sealed.
+    assert daemon.trace.sealed is True
 
     # A kill request cannot un-kill or re-trigger.
     reply = daemon.dispatch("KILL_REQUEST", {"reason": "please stop"}, context)
@@ -342,18 +347,12 @@ def test_protected_process_cannot_reset_kill_state_through_ipc(harness_factory):
     assert reply["killed"] is True
     assert daemon.state is SessionState.KILLED
 
-    # An evaluate is answered with KILL, never ALLOW.
-    reply = daemon.dispatch(
-        "EVALUATE",
+    # Once the trace is sealed nothing can be evaluated. The request is
+    # refused rather than answered with a decision that could never be
+    # recorded, which is a stronger guarantee than answering KILL: a refusal
+    # cannot move the session anywhere, and it cannot forge an ALLOW either.
+    for attempt in (
         {"event_type": "file_access", "action": "read", "resource": "/tmp/x"},
-        context,
-    )
-    assert reply["decision"] == "KILL"
-    assert reply["killed"] is True
-
-    # A client cannot fabricate its way out either.
-    reply = daemon.dispatch(
-        "EVALUATE",
         {
             "event_type": "file_access",
             "action": "read",
@@ -362,10 +361,16 @@ def test_protected_process_cannot_reset_kill_state_through_ipc(harness_factory):
             "risk": "NORMAL",
             "sequence": 0,
         },
-        context,
-    )
-    assert reply["decision"] == "KILL"
+    ):
+        with pytest.raises(ProtocolError) as excinfo:
+            daemon.dispatch("EVALUATE", attempt, context)
+        assert excinfo.value.code == ErrorCode.SESSION_TERMINAL
+
+    assert daemon.state is SessionState.KILLED
     assert len(events(harness, "kill_switch")) == 1
+    # The refusals changed nothing: the sealed trace is still sound, which is
+    # the property the old append-after-seal behaviour silently broke.
+    assert daemon.verify().valid
 
 
 def test_trace_remains_valid_after_a_kill(harness_factory, tmp_path):
@@ -438,12 +443,23 @@ def test_heartbeat_timeout_is_detected(harness_factory):
     harness = harness_factory(
         "heartbeat",
         # The client is asked to stay silent, so the supervisor notices.
-        child_env={"WATCHER_AGENT_SLEEP": "3", "AGENT_SILENT_HEARTBEAT": "1"},
+        #
+        # The child outlives the session timeout, and the timeout is large
+        # relative to the heartbeat timeout, so the only thing that can end
+        # this session is the session timeout and the only thing that can be
+        # observed first is the lost heartbeat. With a tight budget the test
+        # instead measured how fast the child could start, connect and
+        # authenticate on the machine running it.
+        child_env={"WATCHER_AGENT_SLEEP": "30", "AGENT_SILENT_HEARTBEAT": "1"},
         heartbeat_interval=0.2,
-        heartbeat_timeout=0.6,
+        heartbeat_timeout=0.4,
         heartbeat_action=SupervisoryAction.RECORD,
-        session_timeout=2.5,
+        session_timeout=5.0,
     )
+    # Wait for the observable precondition: the heartbeat clock only starts
+    # once a client has authenticated.
+    assert harness.wait_for_client_authentication(), "no client ever authenticated"
+
     assert harness.wait(timeout=60) == 137
 
     lost = events(harness, "heartbeat_lost")
@@ -451,16 +467,33 @@ def test_heartbeat_timeout_is_detected(harness_factory):
     assert lost[0].risk == "HIGH"
     assert lost[0].metadata["heartbeats_received"] == 0
 
+    # The heartbeat loss must be recorded before the session timeout ended the
+    # session. That ordering is exactly what the budget above is chosen to
+    # guarantee, so asserting it makes the timing assumption explicit instead
+    # of leaving it implicit in the numbers.
+    timeouts = events(harness, "session_timeout")
+    assert timeouts, "the session should have ended on its timeout"
+    assert lost[0].sequence < timeouts[0].sequence, (
+        "the heartbeat loss must be observed before the session timeout fires"
+    )
+    assert harness.daemon.watcher.kill_record.reason == "MAX_RUNTIME_EXCEEDED"
+
 
 def test_heartbeat_can_be_configured_to_quarantine(harness_factory):
     harness = harness_factory(
         "heartbeat",
-        child_env={"WATCHER_AGENT_SLEEP": "4", "AGENT_SILENT_HEARTBEAT": "1"},
+        # Same budget reasoning as the heartbeat-loss test above: the child
+        # outlives the session, and the session timeout is large relative to
+        # the heartbeat timeout, so the heartbeat loss is always observed
+        # before the session ends regardless of host speed.
+        child_env={"WATCHER_AGENT_SLEEP": "30", "AGENT_SILENT_HEARTBEAT": "1"},
         heartbeat_interval=0.2,
-        heartbeat_timeout=0.6,
+        heartbeat_timeout=0.4,
         heartbeat_action=SupervisoryAction.QUARANTINE,
-        session_timeout=2.0,
+        session_timeout=5.0,
     )
+    assert harness.wait_for_client_authentication(), "no client ever authenticated"
+
     assert harness.wait(timeout=60) == 137
 
     assert events(harness, "heartbeat_lost")

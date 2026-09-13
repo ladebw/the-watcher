@@ -15,6 +15,7 @@
 *.json text eol=lf
 *.toml text eol=lf
 *.cfg  text eol=lf
+*.yml  text eol=lf
 
 # Assets: never rewrite these.
 *.png binary

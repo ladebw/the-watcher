@@ -83,19 +83,28 @@ class Recorder:
         reason: str = "",
         metadata: "Mapping[str, Any] | None" = None,
     ) -> PoEEvent:
-        """Redact, stamp and append one event. Returns the stored event."""
-        event = PoEEvent(
-            sequence=0,  # assigned by ExecutionTrace.append
-            timestamp=int(self._clock()),
-            event_type=coerce_event_type(event_type),
-            action=as_text(action),
-            resource=self._redactor.redact_text(as_text(resource)),
-            decision=as_text(decision).upper(),
-            risk=as_text(risk).upper(),
-            reason=as_text(reason),
-            metadata=self._redactor.redact(dict(metadata or {})),
-        )
+        """Redact, stamp and append one event. Returns the stored event.
+
+        The timestamp is taken inside the same critical section that assigns
+        the sequence number. Stamping it outside would let two threads that
+        straddle a whole-second boundary be appended in the opposite order to
+        the one they were stamped in, which the verifier would correctly read
+        as ``TIMESTAMP_REGRESSION`` even though the chain is intact. Sequence,
+        timestamp and chain link therefore all derive from one serialised
+        append.
+        """
         with self._lock:
+            event = PoEEvent(
+                sequence=0,  # assigned by ExecutionTrace.append
+                timestamp=int(self._clock()),
+                event_type=coerce_event_type(event_type),
+                action=as_text(action),
+                resource=self._redactor.redact_text(as_text(resource)),
+                decision=as_text(decision).upper(),
+                risk=as_text(risk).upper(),
+                reason=as_text(reason),
+                metadata=self._redactor.redact(dict(metadata or {})),
+            )
             return self._trace.append(event)
 
     def record_tool(

@@ -44,8 +44,10 @@ from ..exceptions import (
     ContainmentRefused,
     ContainmentStartError,
     EnforcementUnavailable,
+    IpcDrainTimeout,
     ProtocolError,
     SessionStateError,
+    TraceSealedError,
 )
 from ..enforcement import (
     ContainmentProfile,
@@ -146,6 +148,10 @@ class DaemonConfig:
 
     limits: "IpcLimits | None" = None
     ipc_timeout: float = 5.0
+    #: How long the supervisor waits for IPC writers to stop before sealing.
+    #: Bounded so a wedged worker cannot hang the session, and exceeded only
+    #: as an explicit, recorded failure.
+    ipc_drain_timeout: float = 5.0
     fail_mode: str = "fail_closed"
 
     heartbeat_interval: float = 5.0
@@ -232,6 +238,10 @@ class WatcherDaemon:
         self._quit = threading.Event()
         self._started = False
         self._finalised = False
+        #: Set under ``_lock`` as the first act of finalisation. Any thread
+        #: that could append to the trace checks it under the same lock, so
+        #: once it is set no new authoritative write can begin.
+        self._shutting_down = False
         self._exit_code: int = 1
         self._internal_error: str = ""
 
@@ -256,6 +266,13 @@ class WatcherDaemon:
         self._termination_recorded = False
         self._started_at: "int | None" = None
         self._metadata: dict[str, Any] = {}
+
+        # Shutdown bookkeeping. ``_ipc_drain_failed`` is non-empty when the
+        # writers did not stop in time, which makes the session a failure
+        # rather than a clean stop.
+        self._ipc_drain: Any = None
+        self._ipc_drain_failed: str = ""
+        self._sealed_verified: "bool | None" = None
 
         # V3 containment state. Empty unless enforced mode is active.
         self._enforcer: Any = None
@@ -321,6 +338,21 @@ class WatcherDaemon:
     @property
     def internal_error(self) -> str:
         return self._internal_error
+
+    @property
+    def ipc_drain(self) -> Any:
+        """Result of the IPC drain, or ``None`` if it never ran."""
+        return self._ipc_drain
+
+    @property
+    def ipc_drain_failed(self) -> str:
+        """Non-empty when IPC writers did not stop before the deadline."""
+        return self._ipc_drain_failed
+
+    @property
+    def sealed_verified(self) -> "bool | None":
+        """``True``/``False`` once the sealed trace has been verified."""
+        return self._sealed_verified
 
     @property
     def process(self) -> "ProcessSupervisor | None":
@@ -421,9 +453,20 @@ class WatcherDaemon:
         return self._exit_code
 
     def stop(self, reason: str = "SUPERVISOR_STOP") -> None:
-        """Ask the supervisor to kill the session. Safe from any thread."""
+        """Ask the supervisor to kill the session. Safe from any thread.
+
+        The check and the kill happen under the daemon lock, and finalisation
+        claims that lock before it seals. So either this kill completes before
+        finalisation starts — and its event is part of the sealed trace — or
+        finalisation has already begun and the kill is skipped. There is no
+        interleaving in which a kill is appended after the seal.
+        """
         with self._lock:
-            if self._watcher is not None and not self._watcher.killed:
+            if (
+                self._watcher is not None
+                and not self._watcher.killed
+                and not self._shutting_down
+            ):
                 self._kill_locked(reason)
         self._quit.set()
 
@@ -1085,14 +1128,23 @@ class WatcherDaemon:
         self, message_type: str, payload: Mapping[str, Any], context: ClientContext
     ) -> dict[str, Any]:
         """Handle one validated client request."""
+        readonly = {
+            MessageType.SESSION_STATUS.value,
+            MessageType.TRACE_INFO.value,
+            MessageType.HEARTBEAT.value,
+            MessageType.SESSION_END.value,
+            MessageType.KILL_REQUEST.value,
+        }
+
+        if self._shutting_down and message_type not in readonly:
+            # Finalisation has begun, so a write would race the seal. Refusing
+            # it here keeps "no new authoritative write once shutdown starts"
+            # true at the API surface, not only down in the trace.
+            raise ProtocolError(
+                ErrorCode.SESSION_TERMINAL, "session is shutting down"
+            )
+
         if self._state.is_terminal:
-            readonly = {
-                MessageType.SESSION_STATUS.value,
-                MessageType.TRACE_INFO.value,
-                MessageType.HEARTBEAT.value,
-                MessageType.SESSION_END.value,
-                MessageType.KILL_REQUEST.value,
-            }
             evaluating_after_kill = (
                 message_type == MessageType.EVALUATE.value and self.killed
             )
@@ -1101,22 +1153,36 @@ class WatcherDaemon:
                     ErrorCode.SESSION_TERMINAL, "session has finished"
                 )
 
-        if message_type == MessageType.EVALUATE.value:
-            return self._handle_evaluate(payload, context)
-        if message_type == MessageType.EVENT.value:
-            return self._handle_event(payload, context)
-        if message_type == MessageType.HEARTBEAT.value:
-            return self._handle_heartbeat(payload, context)
-        if message_type == MessageType.SESSION_STATUS.value:
-            return self._handle_status()
-        if message_type == MessageType.TRACE_INFO.value:
-            return self._handle_trace_info()
-        if message_type == MessageType.KILL_REQUEST.value:
-            return self._handle_kill_request(payload, context)
-        if message_type == MessageType.SESSION_END.value:
-            return self._handle_session_end(payload, context)
+        try:
+            if message_type == MessageType.EVALUATE.value:
+                return self._handle_evaluate(payload, context)
+            if message_type == MessageType.EVENT.value:
+                return self._handle_event(payload, context)
+            if message_type == MessageType.HEARTBEAT.value:
+                return self._handle_heartbeat(payload, context)
+            if message_type == MessageType.SESSION_STATUS.value:
+                return self._handle_status()
+            if message_type == MessageType.TRACE_INFO.value:
+                return self._handle_trace_info()
+            if message_type == MessageType.KILL_REQUEST.value:
+                return self._handle_kill_request(payload, context)
+            if message_type == MessageType.SESSION_END.value:
+                return self._handle_session_end(payload, context)
 
-        raise ProtocolError(ErrorCode.UNKNOWN_MESSAGE, "unsupported message type")
+            raise ProtocolError(
+                ErrorCode.UNKNOWN_MESSAGE, "unsupported message type"
+            )
+        except TraceSealedError as exc:
+            # The trace is sealed, so the session is finished and nothing more
+            # may be recorded. A late writer is refused outright: answering it
+            # would mean choosing between corrupting the sealed trace and
+            # replying with a decision that was never recorded. Read-only
+            # requests above are unaffected, so a client can still ask what
+            # happened.
+            raise ProtocolError(
+                ErrorCode.SESSION_TERMINAL,
+                "session trace is sealed and cannot accept new events",
+            ) from exc
 
     def _handle_evaluate(
         self, payload: Mapping[str, Any], context: ClientContext
@@ -1471,9 +1537,20 @@ class WatcherDaemon:
     # -- finalisation ----------------------------------------------------
 
     def _finalize(self, exit_code: int) -> None:
-        if self._finalised:
-            return
-        self._finalised = True
+        # Claim finalisation under the daemon lock before anything else. Every
+        # path that could append to the trace takes this lock and checks
+        # _shutting_down, so after this returns nothing new can start writing
+        # and the seal below cannot be overtaken.
+        #
+        # The lock is deliberately not held for the rest of the method: the
+        # IPC drain joins worker threads, and those workers take this same lock
+        # in their disconnect hooks, so holding it across the join would
+        # deadlock until the drain deadline expired.
+        with self._lock:
+            if self._finalised:
+                return
+            self._finalised = True
+            self._shutting_down = True
         self._exit_code = exit_code
 
         watcher = self._watcher
@@ -1501,12 +1578,19 @@ class WatcherDaemon:
         # machine state in which nothing from the sandbox is still running.
         self._destroy_unit(reason="SESSION_ENDED")
 
+        # 2. Stop the IPC writers before anything else is recorded or sealed.
+        #    This is the step that makes "no active authoritative writer before
+        #    seal" true: the server refuses new requests, waits for in-flight
+        #    handlers and for the worker threads that own them to exit, and
+        #    reports failure rather than guessing if they will not.
+        self._stop_ipc()
+
         # A client that died without saying goodbye is still a fact about the
-        # session, and it may not have been noticed by the IPC server before
-        # the process exit ended the loop.
+        # session. It is recorded after the drain so the disconnect hooks have
+        # had their say first, and only a genuinely lost client is flagged.
         self._record_vanished_client()
 
-        # 2. Lifecycle events, then stop accepting work before sealing.
+        # 3. Lifecycle events.
         self._record(
             EventType.PROCESS_EXITED,
             action="exit",
@@ -1545,9 +1629,9 @@ class WatcherDaemon:
             },
         )
 
-        self._stop_ipc()
-
-        # 3. Seal: after this, nothing may be appended.
+        # 4. Seal: after this, nothing may be appended. The trace enforces
+        #    that itself now, so a straggler write raises rather than quietly
+        #    invalidating the declared final hash.
         self._record(
             EventType.TRACE_SEALED,
             action="seal",
@@ -1558,7 +1642,10 @@ class WatcherDaemon:
         )
         watcher.seal()
 
-        # 4. Persist the authoritative artefacts.
+        # 5. Verify the sealed trace before it is written out.
+        self._verify_sealed()
+
+        # 6. Persist the authoritative artefacts.
         self._metadata = self._build_metadata(exit_code)
         try:
             self._storage.write_trace(self._session_id, watcher.trace)
@@ -1579,17 +1666,65 @@ class WatcherDaemon:
                     )
 
     def _stop_ipc(self) -> None:
+        """Drain the IPC writers, or record that they would not drain.
+
+        The supervisor must not seal while a worker could still append, so a
+        drain that does not finish is an explicit failure rather than a
+        silent proceed. The sealed-append guard in the PoE layer is the
+        backstop if this ever fires, but the session is marked failed and the
+        condition is written to the trace so it cannot pass unnoticed.
+        """
         server = self._server
-        if server is not None:
-            try:
-                server.stop()
-            except Exception:  # noqa: BLE001 - shutdown is best effort
-                pass
-        elif self._listener is not None:
-            try:
-                self._listener.close()
-            except Exception:  # noqa: BLE001
-                pass
+        if server is None:
+            if self._listener is not None:
+                try:
+                    self._listener.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        timeout = self._config.ipc_drain_timeout
+        try:
+            self._ipc_drain = server.stop(timeout)
+        except IpcDrainTimeout as exc:
+            self._ipc_drain_failed = str(exc)
+            message = f"IPC drain timeout: {sanitize_text(str(exc), 300)}"
+            if not self._internal_error:
+                self._internal_error = message
+            if not self._state.is_terminal:
+                self._state.transition_quiet(SessionState.FAILED, "ipc drain timeout")
+            if self._watcher is not None:
+                self._record(
+                    EventType.IPC_DRAIN_TIMEOUT,
+                    action="drain",
+                    resource=(
+                        self._endpoint.display if self._endpoint else "ipc"
+                    ),
+                    decision=Decision.KILL,
+                    risk=Risk.CRITICAL,
+                    reason=message,
+                    metadata={
+                        "timeout_seconds": timeout,
+                        "remaining_workers": list(exc.remaining),
+                    },
+                )
+
+    def _verify_sealed(self) -> None:
+        """Verify the sealed trace and record the outcome.
+
+        Sealing is the moment the audit trail becomes final, so it is also the
+        moment to confirm it is sound. Reporting a failed verification here
+        means a session cannot quietly ship a trace that does not check out.
+        """
+        if self._watcher is None:
+            return
+        result = self._watcher.verify()
+        self._sealed_verified = bool(result.valid)
+        if not result.valid and not self._internal_error:
+            self._internal_error = (
+                "sealed trace failed verification: "
+                + ", ".join(str(signal) for signal in result.signals)
+            )
 
     def _build_metadata(self, exit_code: int) -> dict[str, Any]:
         watcher = self._watcher

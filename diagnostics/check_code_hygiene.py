@@ -104,7 +104,10 @@ def main() -> int:
         print(finding)
     print()
     print(f"{len(findings)} finding(s)")
-    return 0
+    # Exit non-zero on findings, matching check_text_hygiene.py. A hygiene gate
+    # that always exits 0 is decorative: it would make a CI step that can never
+    # fail, which is a worse outcome than not running it at all.
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":

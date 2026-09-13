@@ -20,7 +20,11 @@ from the_watcher import (
     canonical_json,
     hash_value,
 )
-from the_watcher.exceptions import CanonicalizationError, TraceError
+from the_watcher.exceptions import (
+    CanonicalizationError,
+    TraceError,
+    TraceSealedError,
+)
 from the_watcher.poe import sha256_hex
 
 
@@ -377,6 +381,62 @@ def test_trace_load_export_round_trip(clock, tmp_path):
 
     assert TraceVerifier().verify_file(str(path)).valid
     assert TraceVerifier().verify(restored).valid
+
+
+def test_recorder_refuses_to_append_after_the_trace_is_sealed(clock):
+    """Sealing must make further writes impossible, not merely detectable.
+
+    This is the defence-in-depth half of the shutdown fix: even if a writer
+    outlived the IPC drain, it cannot alter the sealed trace. Letting the
+    append through would change the event count and head hash, so verification
+    would report INVALID_FINAL_TRACE_HASH for a trace nobody tampered with.
+    """
+    recorder = Recorder(session_id="sealed-append", clock=clock)
+    recorder.record("session_start", "start", "python agent.py")
+    recorder.record("file_access", "read", "/workspace/a.txt")
+    recorder.seal()
+
+    declared = recorder.trace.declared_final_hash
+    count = len(recorder.trace)
+
+    with pytest.raises(TraceSealedError):
+        recorder.record("file_access", "read", "/etc/shadow")
+
+    # Nothing moved: not the length, not the declared hash, not the live hash.
+    assert len(recorder.trace) == count
+    assert recorder.trace.declared_final_hash == declared
+    assert recorder.trace.compute_final_hash() == declared
+    assert recorder.trace.sealed is True
+    assert recorder.trace.verify().valid
+
+
+def test_recorder_refuses_the_tool_helpers_after_sealing(clock):
+    """Every write path goes through the same sealed-trace guard."""
+    recorder = Recorder(session_id="sealed-tools", clock=clock)
+    recorder.seal()
+
+    with pytest.raises(TraceSealedError):
+        recorder.record_tool("shell")
+
+    with pytest.raises(TraceSealedError):
+
+        @recorder.track_tool("web_search")
+        def web_search(query: str) -> str:
+            return query
+
+        web_search("leak")
+
+
+def test_sealing_twice_is_stable(clock):
+    """Re-sealing an unchanged trace must not move the declared hash."""
+    recorder = Recorder(clock=clock)
+    recorder.record("session_start", "start", "agent.py")
+
+    first = recorder.seal()
+    second = recorder.seal()
+
+    assert first == second
+    assert recorder.trace.verify().valid
 
 
 def test_trace_rejects_missing_session_id():
