@@ -278,7 +278,7 @@ against an attacker who owns the storage.
 
 ### Validation
 
-* **pytest** — 453 tests passing on Windows, more on Linux where the V3 suite runs
+* **pytest** — 460 tests passing on Windows, more on Linux where the V3 suite runs
 * **Ruff** — lint, clean
 
 ### Optional backend
@@ -615,13 +615,15 @@ Platform and implementation limits, stated plainly:
   `connect()` to an `AF_UNIX` socket requires write permission. The workload can
   delete it and break its own control channel; it cannot impersonate the
   supervisor.
-* **Two PoE defects were found and fixed while preparing CI** — one stamped
-  event timestamps outside the lock that orders appends, the other let a late
-  `stop()` append after the trace had been sealed. Both made a valid, untampered
-  trace verify as **tampered**: `TIMESTAMP_REGRESSION` and
-  `INVALID_FINAL_TRACE_HASH` respectively. A sealed trace now refuses further
-  appends outright, and both have deterministic regression tests. See
-  [Development Notes](#development-notes).
+* **Three PoE defects were found and fixed while preparing CI** — one stamped
+  event timestamps outside the lock that orders appends, one let a late
+  `stop()` append after the trace had been sealed, and one let a host clock step
+  be read as reordering. All three made a valid, untampered trace verify as
+  **tampered**, as `TIMESTAMP_REGRESSION` or `INVALID_FINAL_TRACE_HASH`. A
+  sealed trace now refuses further appends outright, timestamps cannot go
+  backwards within a trace, a backwards clock step is recorded as
+  `clock_regression` evidence rather than discarded, and all three have
+  deterministic regression tests. See [Development Notes](#development-notes).
 
 ---
 
@@ -681,19 +683,30 @@ Current status:
 
 | Platform | Result |
 | --- | --- |
-| Windows (Python 3.14) | **453 passed, 61 skipped** |
-| Linux / WSL2 (Python 3.12) | **512 passed, 2 skipped** |
+| Windows (Python 3.14) | **460 passed, 61 skipped** |
+| Linux / WSL2 (Python 3.12) | **519 passed, 2 skipped** |
 
-On Windows the V3 suite skips, and says why rather than passing silently:
+`tests/test_v3_containment.py` is the only module that needs OS-enforced
+containment, so it carries the `v3` marker and the cross-platform matrix
+deselects it rather than running it somewhere it cannot pass:
+
+```bash
+python -m pytest                # everything this host can attempt
+python -m pytest -m "not v3"    # the cross-platform matrix
+python -m pytest -m v3          # the Linux-only containment suite
+```
+
+Under `-m v3` on Windows the suite skips, and says why rather than passing
+silently:
 
 ```
 V3 OS-enforced containment requires Linux with user namespaces and seccomp;
 this is win32. V2 external supervision remains available here.
 ```
 
-The suite is green on both platforms. Two PoE defects and one test-side timing
-budget were found while preparing CI and are now fixed, each with a regression
-test; see [Limitations](#limitations) and
+The suite is green on both platforms. Three PoE defects, one test-side timing
+budget and one deadlock-prone test were found while preparing CI and are now
+fixed, each with a regression test; see [Limitations](#limitations) and
 [Development Notes](#development-notes). No retry and no `continue-on-error` is
 used anywhere, so an intermittent failure shows up as a red run.
 
@@ -704,13 +717,18 @@ bash diagnostics/run_tests_linux.sh
 bash diagnostics/final_check.sh      # tests, doctor, containment, refusal, V2
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same commands on GitHub-hosted runners:
-a quality job that lints and runs the hygiene and secret scans, a test job across
-Linux and Windows on Python 3.10, 3.12 and 3.14, and a Linux job for the V3
-containment tests. The V3 job **fails closed**: if the runner cannot enforce
-containment, `doctor` fails the job rather than letting it pass without having
-exercised anything. There are **no retries and no `continue-on-error`**, so an
-intermittent failure shows up as a red run rather than being smoothed over.
+CI (`.github/workflows/ci.yml`) mirrors that split. `quality` runs the lint,
+hygiene and secret scans. `tests` runs `python -m pytest -m "not v3"` across
+Linux and Windows on Python 3.10, 3.12 and 3.14 — deliberately not the
+containment suite, because on `ubuntu-latest` (24.04) the namespace backend is
+unavailable and selection falls back to Docker, which cannot start a container
+with the privileges that job does not take. `v3-containment` owns containment
+exclusively, on `ubuntu-22.04`, and **fails closed**: if the runner cannot
+enforce containment, `doctor` fails the job rather than letting it pass without
+having exercised anything. Every job has a bounded `timeout-minutes`, so a hang
+fails the check instead of burning an hour of runner time. There are **no
+retries and no `continue-on-error`**, so an intermittent failure shows up as a
+red run rather than being smoothed over.
 
 The suite covers:
 
@@ -817,11 +835,11 @@ Known open work:
 
 ## Development Notes
 
-**Two PoE defects found while preparing CI, both fixed.** `test_v2_concurrency.py`
+**Three PoE defects found while preparing CI, all fixed.** `test_v2_concurrency.py`
 and `test_child_processes_are_terminated_with_the_tree` failed intermittently —
 roughly one run in five under load, on Linux and on Windows. They were written
 off as "timing flakes" at first, which was wrong: the tests were right and the
-PoE was not. Both are fixed, each with a regression test.
+PoE was not. Each is fixed, with a regression test.
 
 * **Non-monotonic timestamps.** `Recorder.record()` stamped
   `timestamp=int(self._clock())` *before* taking the lock that orders appends,
@@ -845,6 +863,51 @@ PoE was not. Both are fixed, each with a regression test.
   is part of the sealed trace — or is skipped entirely. There is no interleaving
   in which it lands after the seal.
 
+* **A host clock step read as reordering.** Event timestamps come from
+  `time.time()`, which steps backwards when the host resynchronises its clock:
+  NTP, a VM resuming, or WSL2 catching up with Windows. Verification reads a
+  decreasing timestamp as evidence of a reorder, so a clock step produced
+  `TIMESTAMP_REGRESSION` on a trace nobody had touched. Measured on the
+  development host: one step of **-1.23 s** in 9,698 samples over 200 s, which
+  was enough to fail a concurrency run.
+
+  `ExecutionTrace.append()` now keeps the authoritative timestamp
+  non-decreasing — which is the property the verifier actually checks — **and
+  records the anomaly rather than swallowing it**. The event that would have
+  gone backwards carries a `clock_regression` block in its `metadata`:
+
+  ```json
+  "clock_regression": {
+    "raw_timestamp": 1000,
+    "previous_timestamp": 1001,
+    "delta_seconds": 1
+  }
+  ```
+
+  The raw reading, the timestamp it clashed with and the size of the step all
+  survive, and because metadata is part of the event hash the evidence is
+  itself tamper-evident. The key is **owned by the trace**: anything a caller
+  supplies under it is removed before the event is appended.
+
+  Scoped precisely: the reserved `clock_regression` metadata cannot be supplied
+  by an untrusted agent or client in the authoritative runtime path.
+  Authoritative timestamps are assigned server-side — `AUTHORITATIVE_FIELDS`
+  strips `timestamp` (along with `sequence`, `previous_hash`, `event_hash`,
+  `final_hash`, `decision` and `risk`) from client payloads, recursively, and
+  `Recorder.record()` takes no timestamp argument at all, so the value it
+  stamps can only come from the daemon's own clock. A caller with in-process
+  access can still hand an arbitrary `timestamp` to the internal
+  `ExecutionTrace.append()` / `.add()` APIs and thereby induce a record; that
+  is an embedder path, not the client path, and the evidence would still
+  truthfully report the value it was given.
+
+  `trace.clock_regressions` lists every step observed, in append order, and is
+  empty for an ordinary session.
+
+  This does not blunt the reorder signal: reordering happens to events *after*
+  they were appended, so a swap still produces a decrease and is still reported
+  as `TIMESTAMP_REGRESSION`.
+
 Three further changes came out of the same investigation:
 
 * an execution trace now **refuses** an append once sealed (`TraceSealedError`)
@@ -861,6 +924,20 @@ Three further changes came out of the same investigation:
 * the supervisor drains IPC writers before recording the final lifecycle events
   and sealing, and verifies the sealed trace before writing it out.
 
+**A Windows IPC test could deadlock the whole run.**
+`test_receiver_refuses_an_oversized_frame_without_crashing` sent a 20 KB frame
+into a pipe whose reader had not read yet. On Windows that write is an overlapped
+`WriteFile` that waits forever once the pipe fills, and the reader refuses the
+frame on its length prefix without draining the body — so the writer could never
+finish. It hung CI for 1 h 35 m on Python 3.10 and 3.12; 3.14 happened not to
+block. The frame now exceeds the receiver's limit by more than 2x while fitting
+inside the pipe buffer, so the send always completes and the assertion is
+unchanged. `test_ipc_auth.py`'s protocol-violation test had the same shape and is
+now driven by a separate, bounded adversarial peer process
+(`tests/agents/malformed_sender.py`): a malformed client is allowed to wedge
+itself, the test is not. The authoritative assertion in both cases is on the
+server — it must detect and report the violation and drop the connection.
+
 **One test-side timing budget was also wrong.** The heartbeat test passed only
 when the child booted, connected and authenticated in under 1.4 s
 (`session_timeout=2.0` minus `heartbeat_timeout=0.6`), because the session
@@ -872,10 +949,12 @@ timeout enough headroom that it cannot beat the heartbeat timeout, so it
 measures heartbeat behaviour rather than host speed. It also asserts the
 ordering it depends on. No assertion was weakened and no retry was added.
 
-Verification of the fixes, all with no retries: 1000 concurrent-ordering
-iterations with 0 `TIMESTAMP_REGRESSION`; 40 consecutive concurrency-suite runs
-with 0 `INVALID_FINAL_TRACE_HASH`; the heartbeat tests 20 times on Windows and 20
-times on Linux with 0 failures. Before the fixes the concurrency suite was
+Verification of the fixes, all with no retries: the 100-round concurrent-ordering
+test repeated 15 times (1,500 rounds) with 0 `TIMESTAMP_REGRESSION`; the
+concurrency suite 30 times consecutively with 0 failures; the repaired
+protocol-violation test 50 times on Windows with 0 hangs and 0 failures; the four
+IPC modules 20 times with 0 failures; the heartbeat tests 20 times on Windows and
+20 times on Linux with 0 failures. Before the fixes the concurrency suite was
 failing around 1 run in 4.
 
 **One V2 defect was found and fixed during V3 validation.** `IPC_LOST` was never

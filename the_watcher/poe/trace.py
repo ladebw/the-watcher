@@ -23,9 +23,31 @@ from ..exceptions import TraceError, TraceSealedError
 from .canonical import GENESIS_HASH, canonical_bytes, sha256_hex
 from .event import EventType, PoEEvent, as_text, coerce_event_type
 
-__all__ = ["ExecutionTrace", "SCHEMA_VERSION"]
+__all__ = ["CLOCK_REGRESSION_KEY", "ExecutionTrace", "SCHEMA_VERSION"]
 
 SCHEMA_VERSION = "watcher-poe/1"
+
+#: Reserved metadata key under which a trace records a backwards wall-clock
+#: step.
+#:
+#: The trace owns this key: whatever a caller supplies under it is removed
+#: before the event is appended, so the evidence can only ever appear because
+#: the trace itself observed the clock move.
+#:
+#: Scope of that guarantee, stated precisely: an untrusted agent or client
+#: cannot supply this metadata, because the only route from a client into a
+#: trace is the daemon's recorder. ``AUTHORITATIVE_FIELDS`` strips ``timestamp``
+#: (and ``sequence``, ``previous_hash``, ``event_hash``, ``final_hash``,
+#: ``decision``, ``risk``) from client payloads recursively, and
+#: ``Recorder.record()`` accepts no timestamp argument, so the value it stamps
+#: comes only from the daemon's own clock.
+#:
+#: ``append()`` and ``add()`` are internal/embedder APIs, not the client path.
+#: A caller with in-process access can pass an arbitrary ``timestamp`` and so
+#: induce a record. That is not a provenance hole to be papered over: the
+#: evidence still reports the value it was given, and the key is stripped and
+#: re-set by the trace either way.
+CLOCK_REGRESSION_KEY = "clock_regression"
 
 
 @dataclass
@@ -78,11 +100,47 @@ class ExecutionTrace:
                 f"refusing to append {len(self.events)} -> {len(self.events) + 1}"
             )
 
+        # Wall-clock timestamps can step backwards when the host resynchronises
+        # its time - NTP, a VM resuming, or WSL2 catching up with the Windows
+        # clock. Verification reads a decreasing timestamp as evidence of
+        # reordering, so an unclamped step is reported as tampering on a trace
+        # nobody touched. Measured on this machine: one step of -1.23s in 9,698
+        # samples over 200s, which was enough to fail a concurrency run.
+        #
+        # The authoritative timestamp therefore stays non-decreasing, but the
+        # anomaly is not discarded. The raw reading, the timestamp it would
+        # have clashed with, and the size of the step are attached under a
+        # trace-owned key. That lands in ``metadata``, which is part of the
+        # event hash, so the evidence is itself tamper-evident.
+        #
+        # This does not blunt the reorder signal: reordering happens to events
+        # *after* they were appended, so a swap still produces a decrease and
+        # is still reported as ``TIMESTAMP_REGRESSION``.
+        #
+        # ``append`` trusts the timestamp it is given. That is sound on the
+        # authoritative path, where the value can only come from
+        # ``Recorder``'s clock; see the note on CLOCK_REGRESSION_KEY for the
+        # scope of that claim and for what an in-process caller can do.
+        metadata = dict(event.metadata or {})
+        metadata.pop(CLOCK_REGRESSION_KEY, None)
+
+        timestamp = int(event.timestamp)
+        if self.events and timestamp < self.events[-1].timestamp:
+            previous = self.events[-1].timestamp
+            metadata[CLOCK_REGRESSION_KEY] = {
+                "raw_timestamp": timestamp,
+                "previous_timestamp": previous,
+                "delta_seconds": previous - timestamp,
+            }
+            timestamp = previous
+
         chained = replace(
             event,
             sequence=len(self.events),
             previous_hash=self.head_hash,
             event_hash="",
+            timestamp=timestamp,
+            metadata=metadata,
         ).with_hash()
         self.events.append(chained)
         return chained
@@ -165,6 +223,26 @@ class ExecutionTrace:
     @property
     def sealed(self) -> bool:
         return self.declared_final_hash is not None
+
+    @property
+    def clock_regressions(self) -> list[dict[str, Any]]:
+        """Every backwards wall-clock step this trace observed, in append order.
+
+        Empty for an ordinary session. A non-empty list means the host clock
+        moved backwards while the trace was being written - the events
+        themselves stay consistent and verify, which is exactly why the raw
+        anomaly is recorded here rather than allowed to break the sequence.
+
+        Each entry carries ``sequence``, ``raw_timestamp`` (what the clock
+        actually said), ``previous_timestamp`` (the authoritative timestamp it
+        clashed with) and ``delta_seconds``.
+        """
+        found: list[dict[str, Any]] = []
+        for event in self.events:
+            evidence = (event.metadata or {}).get(CLOCK_REGRESSION_KEY)
+            if isinstance(evidence, Mapping):
+                found.append({"sequence": event.sequence, **evidence})
+        return found
 
     # -- verification ----------------------------------------------------
 

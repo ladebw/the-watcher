@@ -26,7 +26,13 @@ from conftest import (
     run_contained,
 )
 
-pytestmark = requires_enforcement()
+# Marked ``v3`` as well as conditionally skipped: the marker is what lets the
+# cross-platform matrix exclude this module structurally, instead of relying on
+# a host probe to notice that containment is impossible here. On a runner that
+# reports Docker as reachable but cannot start a container, the probe says
+# enforcement is available and every test below then fails for a reason that
+# has nothing to do with the Watcher.
+pytestmark = [requires_enforcement(), pytest.mark.v3]
 
 
 # ---------------------------------------------------------------------------

@@ -11,12 +11,26 @@ import pytest
 
 from the_watcher import Decision, Policy, Tripwire
 from the_watcher.exceptions import ProtocolError
-from the_watcher.ipc.protocol import ErrorCode
+from the_watcher.ipc.protocol import (
+    ErrorCode,
+    IpcLimits,
+    MessageType,
+    build_request,
+)
 from the_watcher.ipc.server import ClientContext
-from the_watcher.ipc.transport import create_endpoint
+from the_watcher.ipc.transport import (
+    CLIENT_RECEIVE_TYPES,
+    connect,
+    create_endpoint,
+)
+from the_watcher.poe.trace import CLOCK_REGRESSION_KEY
 from the_watcher.supervisor import SessionState, SupervisoryAction
 
 from conftest import PROJECT_ROOT, pid_is_alive, wait_for
+
+#: An unmistakable sentinel: far outside any plausible wall-clock reading, so
+#: "it is not in the trace" is a meaningful assertion rather than a coincidence.
+FORGED_TIMESTAMP = 4_242_424_242
 
 
 def ctx(**overrides) -> ClientContext:
@@ -315,6 +329,105 @@ def test_child_processes_are_terminated_with_the_tree(harness_factory, tmp_path)
 
     assert wait_for(lambda: not pid_is_alive(child_pid), timeout=20)
     assert harness.daemon.verify().valid
+
+
+def test_a_client_cannot_supply_a_timestamp_or_clock_regression_evidence(
+    harness_factory,
+):
+    """The authoritative timestamp, and the evidence about it, are server-side.
+
+    A client can put anything it likes in its payload. What it cannot do is
+    reach the trace with it: ``AUTHORITATIVE_FIELDS`` strips daemon-owned names
+    recursively, and the reserved ``clock_regression`` key is owned by the
+    trace, which removes whatever a caller supplied before deciding anything.
+
+    Bare ``raw_timestamp`` / ``previous_timestamp`` / ``delta_seconds`` keys
+    are *not* reserved: they survive as ordinary client metadata, attributed to
+    the client. They are never promoted into evidence, because evidence lives
+    only under the reserved key. This test pins that distinction down.
+    """
+    harness = harness_factory("normal", child_env={"WATCHER_AGENT_SLEEP": "20"})
+    assert harness.wait_until_running(), "session should start"
+    daemon = harness.daemon
+
+    limits: IpcLimits = daemon._server.limits  # trusted-side access, same process
+    connection = connect(daemon.endpoint, timeout=10.0)
+    try:
+        connection.send(
+            build_request(
+                MessageType.HELLO,
+                {"token": daemon._token, "pid": os.getpid(), "protocol_version": 1},
+                session_id=daemon.session_id,
+            ),
+            limits,
+        )
+        hello = connection.receive(limits, allowed_types=CLIENT_RECEIVE_TYPES)
+        assert hello["ok"] is True, hello
+
+        forged = {
+            "event_type": "tool_request",
+            "action": "invoke",
+            "resource": "search",
+            # daemon-owned fields, top level
+            "timestamp": FORGED_TIMESTAMP,
+            "sequence": 999,
+            "previous_hash": "f" * 64,
+            "event_hash": "e" * 64,
+            "metadata": {
+                # the reserved key, in full forged-evidence shape
+                CLOCK_REGRESSION_KEY: {
+                    "raw_timestamp": FORGED_TIMESTAMP,
+                    "previous_timestamp": FORGED_TIMESTAMP,
+                    "delta_seconds": 424242,
+                },
+                # and the evidence fields on their own, outside the key
+                "raw_timestamp": FORGED_TIMESTAMP,
+                "previous_timestamp": FORGED_TIMESTAMP,
+                "delta_seconds": 424242,
+                # a nested daemon-owned field, to prove stripping recurses
+                "nested": {"timestamp": FORGED_TIMESTAMP, "note": "keep me"},
+                "keep_me": "ordinary metadata survives",
+            },
+        }
+        connection.send(
+            build_request(MessageType.EVENT, forged, session_id=daemon.session_id),
+            limits,
+        )
+        response = connection.receive(limits, allowed_types=CLIENT_RECEIVE_TYPES)
+        assert response["ok"] is True, response
+    finally:
+        connection.close()
+
+    trace = daemon.trace
+
+    # Nothing anywhere in the trace is forged evidence.
+    assert trace.clock_regressions == []
+    assert all(CLOCK_REGRESSION_KEY not in event.metadata for event in trace)
+    assert all(event.timestamp != FORGED_TIMESTAMP for event in trace)
+    assert all(event.sequence < 999 for event in trace)
+
+    recorded = [event for event in trace if event.event_type == "tool_request"]
+    assert recorded, "the client's event should still be recorded"
+    event = recorded[-1]
+
+    # The attempt was noticed and reported as a security signal...
+    rejected = [
+        e for e in trace if e.event_type == "client_field_rejected"
+    ]
+    assert rejected, "supplying daemon-owned fields should be recorded"
+    assert "timestamp" in rejected[-1].metadata["fields"]
+
+    # ...ordinary client metadata survived...
+    assert event.metadata["keep_me"] == "ordinary metadata survives"
+    assert event.metadata["nested"] == {"note": "keep me"}
+    # ...the reserved key did not...
+    assert CLOCK_REGRESSION_KEY not in event.metadata
+    # ...and the bare evidence fields are inert client metadata, not evidence.
+    assert event.metadata["raw_timestamp"] == FORGED_TIMESTAMP
+    assert trace.clock_regressions == []
+
+    # The trace still verifies: none of this corrupted anything.
+    assert daemon.verify().valid
 
 
 def test_kill_state_is_irreversible(harness_factory):

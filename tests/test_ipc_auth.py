@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import os
-
+import pathlib
+import subprocess
+import sys
+import threading
 
 from the_watcher.exceptions import IpcTransportError, ProtocolError
+from the_watcher.ipc.client import (
+    ENV_ENDPOINT,
+    ENV_FAMILY,
+    ENV_SESSION_ID,
+    ENV_TOKEN,
+)
 from the_watcher.ipc.protocol import (
     ErrorCode,
     IpcLimits,
@@ -21,10 +30,19 @@ from the_watcher.ipc.transport import (
     create_endpoint,
 )
 
+from conftest import PROJECT_ROOT, wait_for
+
 SESSION_ID = "authtest001"
 TOKEN = "test-token-value-that-must-never-be-logged"
 
 LIMITS = IpcLimits(handshake_timeout=3.0, request_timeout=3.0)
+
+#: The peer that sends the oversized frame. It runs as its own process because
+#: a malformed sender can legitimately wedge itself on a Windows named-pipe
+#: write once the server closes the pipe, and the test must not inherit that.
+MALFORMED_SENDER = (
+    pathlib.Path(__file__).resolve().parent / "agents" / "malformed_sender.py"
+)
 
 
 class StubHandler:
@@ -36,6 +54,9 @@ class StubHandler:
         self.disconnected: list[tuple[str, str]] = []
         self.violations: list[tuple[str, str]] = []
         self.requests: list[tuple[str, dict]] = []
+        #: Set the moment the server reports a violation, so a test can wait on
+        #: the server instead of polling.
+        self.violation_event = threading.Event()
 
     def session_snapshot(self) -> dict:
         return {
@@ -60,6 +81,7 @@ class StubHandler:
 
     def on_protocol_violation(self, code, detail, context) -> None:
         self.violations.append((code, detail))
+        self.violation_event.set()
 
 
 @contextlib.contextmanager
@@ -333,34 +355,77 @@ def test_connection_limit_is_enforced():
             first.close()
 
 
+#: How long the server gets to notice the malformed frame, and how long the
+#: peer gets to exit once it has been told to. Both are orders of magnitude
+#: more than the work needs, and both are bounded so a wedged peer can never
+#: consume a CI job the way it once consumed 95 minutes of one.
+VIOLATION_TIMEOUT = 15.0
+PEER_EXIT_TIMEOUT = 5.0
+
+
+def stop_peer(process: "subprocess.Popen") -> None:
+    """Stop the malformed peer, killing it if it will not go.
+
+    Being stuck is an expected outcome, not a bug: once the server has closed
+    the pipe, the peer can be sitting in a Windows overlapped write that will
+    never complete.
+    """
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=PEER_EXIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=PEER_EXIT_TIMEOUT)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            pass
+
+
 def test_protocol_violations_are_reported_to_the_handler():
+    """A malformed peer is refused, recorded, and cannot stall the run.
+
+    The oversized frame is sent by a separate process. Sent from inside this
+    process it can deadlock pytest itself on Windows named pipes: the sender
+    blocks part-way through a frame larger than the pipe buffer, while the
+    server has already read the length prefix, refused the frame without
+    draining it and closed the pipe.
+
+    That is a property of the peer, not of the Watcher, so the authoritative
+    assertion is on the server side: it must detect and report the violation,
+    and drop the connection, without the test run hanging.
+    """
     limits = IpcLimits(handshake_timeout=3.0, max_message_bytes=2048)
     with running_server(limits=limits) as (server, endpoint, handler):
-        connection = open_client(endpoint)
+        env = dict(os.environ)
+        env.update(
+            {
+                ENV_SESSION_ID: SESSION_ID,
+                ENV_TOKEN: TOKEN,
+                ENV_ENDPOINT: endpoint.address,
+                ENV_FAMILY: endpoint.family,
+            }
+        )
+        process = subprocess.Popen(
+            [sys.executable, str(MALFORMED_SENDER)],
+            env=env,
+            cwd=str(PROJECT_ROOT),
+        )
         try:
-            # A well-formed HELLO, then an oversized frame.
-            assert send_hello(connection, limits=limits)["ok"] is True
-            connection.send(
-                build_request(
-                    MessageType.EVENT,
-                    {"event_type": "tool_request", "action": "big", "resource": "x" * 20000},
-                    session_id=SESSION_ID,
-                ),
-                IpcLimits(),
+            assert handler.violation_event.wait(VIOLATION_TIMEOUT), (
+                "the server never reported the malformed frame; "
+                f"peer exit={process.poll()}"
             )
-            # The server refuses the frame; it either returns an error or drops
-            # the connection, but it must not be desynchronised by the leftovers.
-            response = read_response(connection, limits)
-            if response is not None:
-                assert response["ok"] is False
         finally:
-            connection.close()
+            stop_peer(process)
 
-        import time
-
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not handler.violations:
-            time.sleep(0.02)
+        # The offending connection is dropped rather than resynchronised: the
+        # frame body was never drained, so the stream is known to be out of
+        # sync and any further read would be reading a frame's tail.
+        assert wait_for(lambda: server.connection_count == 0, timeout=5.0), (
+            "the server kept the connection that violated the protocol"
+        )
 
     assert handler.violations, "oversized frame should be reported as a violation"
     assert any(code == "MESSAGE_TOO_LARGE" for code, _ in handler.violations)

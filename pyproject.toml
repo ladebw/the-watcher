@@ -32,6 +32,16 @@ include = ["the_watcher*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    # The only tests that need OS-enforced containment, and therefore the only
+    # ones that need Linux with unprivileged user namespaces plus seccomp.
+    # CI runs them in a dedicated ubuntu-22.04 job and deselects them
+    # everywhere else with `-m "not v3"`, because on a runner that cannot
+    # contain, backend selection falls back to Docker and cannot start a
+    # container - which fails for runner-environment reasons rather than
+    # Watcher defects.
+    "v3: OS-enforced containment tests (Linux only; run in the dedicated V3 job)",
+]
 
 [tool.ruff]
 # Pin the oldest supported interpreter so Ruff flags anything that would not

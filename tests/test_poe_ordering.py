@@ -24,7 +24,8 @@ import threading
 
 import pytest
 
-from the_watcher import Recorder
+from the_watcher import ExecutionTrace, Recorder
+from the_watcher.poe.trace import CLOCK_REGRESSION_KEY
 
 #: Bounded wait for the other thread to reach the clock. On correct code that
 #: can never happen, so this always expires. Kept small so the probe does not
@@ -173,6 +174,166 @@ def test_a_slow_stamp_cannot_reorder_the_append():
     timestamps = [event.timestamp for event in recorder.trace]
     assert timestamps == sorted(timestamps), f"timestamps regressed: {timestamps}"
     assert recorder.trace.verify().valid
+
+
+def test_a_backwards_clock_step_does_not_look_like_tampering():
+    """A host clock step must not be reported as reordering.
+
+    ``time.time()`` can step backwards when the host resynchronises its clock:
+    NTP, a VM resuming, or WSL2 catching up with Windows. Verification reads a
+    decreasing timestamp as evidence of a reorder, so an unclamped step is a
+    false tamper verdict on an untouched trace. Measured on the development
+    host: one -1.23s step in 9,698 samples over 200 seconds, which was enough
+    to fail a concurrency run.
+
+    The recorded sequence must stay non-decreasing. Genuine reordering is still
+    detected, because a swap happens to events after they were appended, and is
+    covered by tests/test_tampering.py.
+    """
+    # Reading 0 is consumed by ``Recorder.__init__`` for the trace's
+    # created_at; the five after it are the five event stamps, with a step
+    # backwards in the middle.
+    readings = iter([990.0, 1000.0, 1001.0, 1000.2, 1000.4, 1002.0])
+    recorder = Recorder(session_id="clock-step", clock=lambda: next(readings))
+
+    for _ in range(5):
+        recorder.record("tool_request", "invoke:search")
+
+    trace = recorder.trace
+    timestamps = [event.timestamp for event in trace]
+
+    # 1. The authoritative sequence never goes backwards...
+    assert timestamps == sorted(timestamps), (
+        f"a backwards clock step produced a decreasing sequence: {timestamps}"
+    )
+    assert timestamps == [1000, 1001, 1001, 1001, 1002]
+
+    # 2. ...so the trace still verifies: a clock step is not a tamper report.
+    assert trace.verify().valid
+
+    # 3. The anomaly is not discarded. The events that would have gone
+    #    backwards carry the raw reading, the timestamp it clashed with, and
+    #    the size of the step.
+    regressions = trace.clock_regressions
+    assert [entry["sequence"] for entry in regressions] == [2, 3]
+    for entry in regressions:
+        assert entry["raw_timestamp"] == 1000
+        assert entry["previous_timestamp"] == 1001
+        assert entry["delta_seconds"] == 1
+
+    # 4. Events that did not regress carry no evidence at all.
+    for event in trace:
+        if event.sequence not in (2, 3):
+            assert CLOCK_REGRESSION_KEY not in event.metadata
+
+
+def test_a_normal_clock_produces_no_regression_evidence():
+    """An increasing clock records nothing: no evidence, no noise."""
+    recorder = Recorder(session_id="clock-normal", clock=CountingClock())
+    for _ in range(6):
+        recorder.record("tool_request", "invoke:search")
+
+    assert recorder.trace.clock_regressions == []
+    assert all(
+        CLOCK_REGRESSION_KEY not in event.metadata
+        for event in recorder.trace
+    )
+    assert recorder.trace.verify().valid
+
+
+def test_a_client_cannot_forge_clock_regression_evidence():
+    """The evidence is trusted: a caller cannot manufacture it.
+
+    Events carry caller-supplied metadata, so if the key were not owned by the
+    trace a client could claim the clock moved. Only the reserved key is
+    touched; the rest of the caller's metadata is left alone.
+    """
+    recorder = Recorder(session_id="clock-forge", clock=CountingClock())
+    event = recorder.record(
+        "tool_request",
+        "invoke:search",
+        metadata={
+            "keep": "me",
+            CLOCK_REGRESSION_KEY: {
+                "raw_timestamp": 1,
+                "previous_timestamp": 999999,
+                "delta_seconds": 999998,
+            },
+        },
+    )
+
+    assert CLOCK_REGRESSION_KEY not in event.metadata
+    assert event.metadata.get("keep") == "me"
+    assert recorder.trace.clock_regressions == []
+    assert recorder.trace.verify().valid
+
+
+def test_a_forged_entry_cannot_survive_a_real_clock_step():
+    """A forged entry is replaced by what the trace actually observed."""
+    readings = iter([990.0, 1001.0, 1000.0])
+    recorder = Recorder(session_id="clock-forge-step", clock=lambda: next(readings))
+    recorder.record("tool_request", "invoke:search")
+    event = recorder.record(
+        "tool_request",
+        "invoke:search",
+        metadata={
+            CLOCK_REGRESSION_KEY: {
+                "raw_timestamp": 1,
+                "previous_timestamp": 2,
+                "delta_seconds": 1,
+            }
+        },
+    )
+
+    evidence = event.metadata[CLOCK_REGRESSION_KEY]
+    assert evidence["raw_timestamp"] == 1000
+    assert evidence["previous_timestamp"] == 1001
+    assert evidence["delta_seconds"] == 1
+    assert recorder.trace.verify().valid
+
+
+def test_clock_regression_evidence_survives_export_and_reload():
+    """The evidence must be in the serialised trace, not just in memory.
+
+    "Preserved" has to mean observable in the exported audit trail, not merely
+    in the live object that happened to notice the step.
+    """
+    readings = iter([990.0, 1001.0, 1000.0])
+    recorder = Recorder(session_id="clock-export", clock=lambda: next(readings))
+    recorder.record("tool_request", "invoke:search")
+    recorder.record("tool_request", "invoke:search")
+    recorder.seal()
+
+    payload = recorder.trace.to_json()
+    restored = ExecutionTrace.from_json(payload)
+
+    assert CLOCK_REGRESSION_KEY in payload
+    assert restored.clock_regressions == recorder.trace.clock_regressions
+    assert restored.clock_regressions[0]["raw_timestamp"] == 1000
+    assert restored.verify().valid
+
+
+def test_reordered_events_are_still_reported_as_tampering():
+    """Recording a clock step must not blunt reorder detection.
+
+    Reordering happens to events *after* they were appended, so the swapped
+    pair still shows a decrease and is still reported.
+    """
+    recorder = Recorder(session_id="reorder", clock=CountingClock())
+    for _ in range(4):
+        recorder.record("file_access", "read", "/workspace/f.txt")
+
+    trace = recorder.trace
+    assert trace.verify().valid
+    assert trace.clock_regressions == []
+
+    trace.events[1], trace.events[2] = trace.events[2], trace.events[1]
+    result = trace.verify()
+
+    assert not result.valid
+    assert any(
+        signal.startswith("TIMESTAMP_REGRESSION") for signal in result.signals
+    ), result.signals
 
 
 @pytest.mark.parametrize("rounds", [100])

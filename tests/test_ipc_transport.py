@@ -194,17 +194,30 @@ def test_sender_refuses_to_exceed_its_own_message_limit():
 
 
 def test_receiver_refuses_an_oversized_frame_without_crashing():
-    """A hostile peer cannot make the daemon allocate an unbounded message."""
-    strict = IpcLimits(max_message_bytes=2048, handshake_timeout=3.0)
+    """A hostile peer cannot make the daemon allocate an unbounded message.
+
+    The frame must exceed the *receiver's* limit but still fit in the pipe's
+    kernel buffer. A frame larger than that buffer deadlocks the test rather
+    than exercising the receiver: the sender blocks inside ``send_bytes`` with
+    a partially written frame, the receiver reads the length prefix, refuses
+    the frame *without draining its body*, and the sender is left writing into
+    a pipe nobody will ever read again. On Windows that pending overlapped
+    write waits forever, which is what hung CI for 95 minutes.
+
+    Exceeding the limit by better than 2x keeps the assertion identical while
+    making the send unbounded-block-free on every platform.
+    """
+    strict = IpcLimits(max_message_bytes=1024, handshake_timeout=3.0)
     permissive = IpcLimits()
 
     with ipc_pair(limits=strict) as (server, client, _):
-        # The client is not bound by the server's limit, so it can send a big
-        # frame that the server must reject.
+        # The client is not bound by the server's limit, so it can send a frame
+        # the server must reject. ~2 KB against a 1 KB limit: refused, but far
+        # below the ~8 KB pipe buffer, so this write always completes.
         client.send(
             build_request(
                 MessageType.EVENT,
-                {"event_type": "tool_request", "action": "big", "resource": "x" * 20000},
+                {"event_type": "tool_request", "action": "big", "resource": "x" * 2000},
                 "testsession",
             ),
             permissive,
