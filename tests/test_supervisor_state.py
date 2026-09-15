@@ -355,9 +355,29 @@ def test_terminate_before_start_is_an_error():
 
 
 def test_safe_state_contains_no_environment():
+    """A child's environment must never surface through ``safe_state()``.
+
+    The child gets the real inherited environment plus a sentinel - not a
+    one-variable environment. ``LocalProcess`` passes ``env`` straight to
+    ``Popen``, so passing only the sentinel *replaces* the environment, and
+    that is deliberate production behaviour: an intentionally isolated child
+    must not inherit host variables.
+
+    The side effect is that such a child has no ``SystemRoot`` and no ``PATH``,
+    and CPython 3.10 on the Windows runner exits 1 under that artificial
+    environment while later versions tolerate it. That is a property of the
+    host, not of ``safe_state()``, and it is not what this test is about.
+
+    This test means exactly: a child may hold sensitive environment values, and
+    ``safe_state()`` never exposes them. It does not mean "CPython must boot
+    with a one-variable environment".
+    """
+    env = os.environ.copy()
+    env["SECRET_MARKER"] = "super-secret-value"
+
     supervisor = ProcessSupervisor(
         [sys.executable, "-c", "pass"],
-        env={"SECRET_MARKER": "super-secret-value"},
+        env=env,
     )
     supervisor.start()
     supervisor.wait(timeout=60)
@@ -366,6 +386,11 @@ def test_safe_state_contains_no_environment():
     assert "super-secret-value" not in json.dumps(payload)
     assert payload["returncode"] == 0
     assert payload["command"][0] == sys.executable
+
+    # The strongest form of the privacy claim: the child's environment is not
+    # represented in the payload at all, under any of the obvious names.
+    assert "env" not in payload
+    assert "environment" not in payload
 
 
 def test_missing_executable_is_reported():
