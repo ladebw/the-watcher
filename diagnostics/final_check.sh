@@ -74,10 +74,50 @@ PY
 
 echo
 echo "############ 4. enforced mode refuses an uncontainable workspace ############"
-"$python" -m the_watcher.cli run --enforced --quiet \
-    --workspace "$repo" --storage-root "$storage" \
-    -- "$python" -c "print('should not run')" 2>&1 | tail -2
-echo "exit=${PIPESTATUS[0]}"
+# The property under test is "a workspace this host cannot contain is refused
+# before the workload runs". That only means anything with a workspace the host
+# genuinely cannot contain: Landlock path rules are not honoured on the 9p/drvfs
+# mounts WSL exposes under /mnt, and the backend refuses them.
+#
+# The previous version of this script pointed --workspace at the repository and
+# printed the resulting exit code as if it were the refusal. On an ext4 checkout
+# the repository *is* containable, so the step exited 0 and proved nothing while
+# looking like a pass. It now looks for a genuinely uncontainable path and, when
+# there is none, says so instead of implying otherwise. The dedicated regression
+# is tests/test_v3_containment.py::test_enforced_mode_refuses_a_workspace_it_cannot_contain.
+uncontainable=""
+for candidate in /mnt/c /mnt/d "/mnt/$(id -un 2>/dev/null || echo none)"; do
+    if [ -d "$candidate" ]; then
+        fstype="$(stat -f -c %T "$candidate" 2>/dev/null || echo unknown)"
+        case "$fstype" in
+            9p|drvfs|cifs|smb*|fuse*|nfs*)
+                uncontainable="$candidate"
+                break
+                ;;
+        esac
+    fi
+done
+
+if [ -n "$uncontainable" ]; then
+    echo "workspace: $uncontainable (filesystem: $(stat -f -c %T "$uncontainable"))"
+    "$python" -m the_watcher.cli run --enforced --quiet \
+        --workspace "$uncontainable" --storage-root "$storage" \
+        -- "$python" -c "print('should not run')" 2>&1 | tail -2
+    rc="${PIPESTATUS[0]}"
+    echo "exit=$rc"
+    if [ "$rc" -eq 78 ]; then
+        echo "  REFUSED as expected (exit 78: enforcement could not be applied)"
+    else
+        echo "  UNEXPECTED: expected the enforcement-refused code 78"
+    fi
+else
+    echo "SKIPPED: no known uncontainable workspace available on this host"
+    echo "  (no 9p/drvfs/network filesystem mount was found, so a workspace the"
+    echo "   host cannot contain could not be constructed. This step proved"
+    echo "   NOTHING about the refusal path.)"
+    echo "  The property is covered by:"
+    echo "    tests/test_v3_containment.py::test_enforced_mode_refuses_a_workspace_it_cannot_contain"
+fi
 
 echo
 echo "############ 5. V2 (unenforced) supervision ############"

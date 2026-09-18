@@ -44,6 +44,17 @@ from .capabilities import (
     clear_capability_cache,
     detect_capabilities,
 )
+from .declared import (
+    NEVER_OVERRIDABLE,
+    Enforcement,
+    FieldEnforcement,
+    enforcement_report,
+    refusals,
+    report_summary,
+    require_honourable,
+    unhonoured,
+    unsupported_summary,
+)
 from .profile import (
     PROFILE_PRESETS,
     ContainmentProfile,
@@ -80,6 +91,16 @@ __all__ = [
     "BackendAvailability",
     "detect_capabilities",
     "clear_capability_cache",
+    # declared versus enforced
+    "Enforcement",
+    "FieldEnforcement",
+    "NEVER_OVERRIDABLE",
+    "enforcement_report",
+    "unhonoured",
+    "refusals",
+    "require_honourable",
+    "report_summary",
+    "unsupported_summary",
 ]
 
 

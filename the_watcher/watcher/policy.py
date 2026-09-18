@@ -19,8 +19,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from dataclasses import replace
+
 from ..exceptions import PolicyError
 from ..poe.event import EventType, as_text, coerce_event_type
+from .authority import Authority, candidate_values, resolve_fact
 from .decision import Decision, Evaluation, Risk
 from .matching import (
     any_path_matches,
@@ -31,6 +34,40 @@ from .matching import (
 )
 
 __all__ = ["Policy", "DEFAULT_PROTECTED_ENV_VARS"]
+
+#: Rank used to keep the most severe outcome when a fact has more than one
+#: candidate value. A client-supplied value may only ever add restriction.
+_DECISION_RANK = {
+    Decision.ALLOW: 0,
+    Decision.DENY: 1,
+    Decision.QUARANTINE: 2,
+    Decision.KILL: 3,
+}
+
+
+def _worst(candidates: "Sequence[Evaluation | None]") -> "Evaluation | None":
+    """The most severe of the candidate evaluations, or ``None``.
+
+    Used when a rule input has both an authoritative and a client-asserted
+    candidate: both are evaluated and the strictest verdict wins, so a forged
+    metadata value cannot weaken the decision taken on the recorded resource.
+    """
+    best: "Evaluation | None" = None
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if best is None or _DECISION_RANK[candidate.decision] > _DECISION_RANK[best.decision]:
+            best = candidate
+    return best
+
+
+def _with_facts(
+    evaluation: "Evaluation | None", **facts: Authority
+) -> "Evaluation | None":
+    """Attach fact provenance to a verdict that a rule produced."""
+    if evaluation is None:
+        return None
+    return replace(evaluation, facts={key: value.value for key, value in facts.items()})
 
 #: Environment variables protected by default. Names only — never values.
 DEFAULT_PROTECTED_ENV_VARS: tuple[str, ...] = (
@@ -279,19 +316,26 @@ class Policy:
     ) -> "Evaluation | None":
         if self.allow_host_resource_access:
             return None
-        if kind in _FILE_EVENTS:
-            path = normalise_path(meta.get("path") or resource, base=self.workspace_root)
-            if path and (
-                path.startswith("/proc/1")
-                or path.startswith("/sys/")
-                or path == "/var/run/docker.sock"
-            ):
-                return Evaluation(
-                    Decision.KILL,
-                    Risk.CRITICAL,
-                    "host-level filesystem resource accessed",
-                    "host_resource_access",
-                )
+        if kind not in _FILE_EVENTS:
+            return None
+        return _worst(
+            self._host_resource_verdict(value)
+            for _, value, _ in candidate_values(meta, resource, "path")
+        )
+
+    def _host_resource_verdict(self, raw_path: Any) -> "Evaluation | None":
+        path = normalise_path(raw_path, base=self.workspace_root)
+        if path and (
+            path.startswith("/proc/1")
+            or path.startswith("/sys/")
+            or path == "/var/run/docker.sock"
+        ):
+            return Evaluation(
+                Decision.KILL,
+                Risk.CRITICAL,
+                "host-level filesystem resource accessed",
+                "host_resource_access",
+            )
         return None
 
     def _check_env_var(
@@ -317,7 +361,20 @@ class Policy:
         if kind not in _FILE_EVENTS and not meta.get("path"):
             return None
 
-        raw_path = meta.get("path") or resource
+        # Every candidate is evaluated and the strictest verdict wins. The
+        # recorded resource is the value written into the trace, so a client
+        # that sends ``resource="/etc/shadow"`` with
+        # ``metadata={"path": "/workspace/harmless.txt"}`` cannot point the
+        # check at the harmless path while the trace records the dangerous one.
+        return _with_facts(
+            _worst(
+                self._path_verdict(value) if value is not None else None
+                for _, value, _ in candidate_values(meta, resource, "path")
+            ),
+            path=resolve_fact(meta, "resource")[1],
+        )
+
+    def _path_verdict(self, raw_path: Any) -> "Evaluation | None":
         path = normalise_path(raw_path, base=self.workspace_root)
         if not path:
             return None
@@ -354,13 +411,25 @@ class Policy:
         if kind not in _NETWORK_EVENTS:
             return None
 
-        domain = extract_domain(meta.get("domain") or resource)
+        # Both the recorded resource and any claimed domain are evaluated, so a
+        # client cannot name a benign domain in metadata while the trace records
+        # a connection to somewhere else.
+        return _with_facts(
+            _worst(
+                self._network_verdict(value)
+                for _, value, _ in candidate_values(meta, resource, "domain")
+            ),
+            domain=resolve_fact(meta, "resource")[1],
+        )
+
+    def _network_verdict(self, raw_target: Any) -> "Evaluation | None":
+        domain = extract_domain(raw_target) if raw_target else ""
         if not domain:
             if self.network_is_restricted:
                 return Evaluation(
                     Decision.DENY,
                     Risk.HIGH,
-                    f"network target is not a resolvable host: {resource}",
+                    f"network target is not a resolvable host: {raw_target}",
                     "unresolvable_network_target",
                 )
             return None
@@ -390,7 +459,19 @@ class Policy:
         if kind not in _TOOL_EVENTS:
             return None
 
-        tool = normalise_tool(meta.get("tool") or resource or action)
+        candidates = list(candidate_values(meta, resource, "tool"))
+        if not candidates and action:
+            # Legacy behaviour: a tool request that names its tool in the verb.
+            candidates = [("action", action, Authority.CLIENT_ASSERTED)]
+        return _with_facts(
+            _worst(
+                self._tool_verdict(value) for _, value, _ in candidates
+            ),
+            tool=Authority.CLIENT_ASSERTED,
+        )
+
+    def _tool_verdict(self, raw_tool: Any) -> "Evaluation | None":
+        tool = normalise_tool(raw_tool)
         if not tool:
             return None
 
@@ -420,47 +501,79 @@ class Policy:
         if kind != EventType.PROCESS_CREATION.value:
             return None
 
-        counter = meta.get("process_count")
-        if counter is None:
-            counter = meta.get("child_processes")
-        try:
-            count = int(counter) if counter is not None else 0
-        except (TypeError, ValueError):
+        count = self._process_count_input(meta)
+        if count is None:
             return None
+        _, count_authority = resolve_fact(meta, "process_count")
 
         if count > self.max_processes:
             hard_limit = self.max_processes * self.kill_max_processes_multiplier
             if count > hard_limit:
-                return Evaluation(
-                    Decision.KILL,
-                    Risk.CRITICAL,
-                    f"process tree exploded ({count} > {hard_limit})",
-                    "max_processes_hard",
+                return _with_facts(
+                    Evaluation(
+                        Decision.KILL,
+                        Risk.CRITICAL,
+                        f"process tree exploded ({count} > {hard_limit})",
+                        "max_processes_hard",
+                    ),
+                    process_count=count_authority,
                 )
-            return Evaluation(
-                Decision.DENY,
-                Risk.HIGH,
-                f"child process limit exceeded ({count} > {self.max_processes})",
-                "max_processes",
+            return _with_facts(
+                Evaluation(
+                    Decision.DENY,
+                    Risk.HIGH,
+                    f"child process limit exceeded ({count} > {self.max_processes})",
+                    "max_processes",
+                ),
+                process_count=count_authority,
             )
         return None
+
+    def _process_count_input(self, meta: Mapping[str, Any]) -> "int | None":
+        """The process count to judge, preferring the supervisor's measurement.
+
+        When both exist the **larger** is used: a client that under-reports the
+        tree size cannot evade the ceiling, while over-reporting only tightens
+        the rule against itself.
+        """
+        observed, observed_authority = resolve_fact(meta, "process_count")
+        candidates: list[int] = []
+        for value in (observed, meta.get("child_processes")):
+            try:
+                if value is not None:
+                    candidates.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
+            return None
+        if observed_authority is Authority.OBSERVED:
+            return max(candidates)
+        return candidates[0]
 
     def _check_runtime(
         self, kind: str, action: str, resource: str, meta: Mapping[str, Any]
     ) -> "Evaluation | None":
-        seconds = meta.get("runtime_seconds")
-        if seconds is None:
+        seconds, authority = resolve_fact(meta, "runtime_seconds")
+        candidates: list[float] = []
+        for value in (seconds, meta.get("runtime_seconds")):
+            try:
+                if value is not None:
+                    candidates.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
             return None
-        try:
-            elapsed = float(seconds)
-        except (TypeError, ValueError):
-            return None
+
+        elapsed = max(candidates) if authority is Authority.OBSERVED else candidates[0]
         if elapsed > self.max_runtime_seconds:
-            return Evaluation(
-                Decision.KILL,
-                Risk.HIGH,
-                f"runtime limit exceeded ({elapsed:.0f}s > {self.max_runtime_seconds}s)",
-                "max_runtime",
+            return _with_facts(
+                Evaluation(
+                    Decision.KILL,
+                    Risk.HIGH,
+                    f"runtime limit exceeded ({elapsed:.0f}s > {self.max_runtime_seconds}s)",
+                    "max_runtime",
+                ),
+                runtime_seconds=authority,
             )
         return None
 

@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ...exceptions import (
@@ -41,25 +41,30 @@ from ...exceptions import (
 )
 from ...runtime import LocalProcess
 from ..base import (
+    ContainmentIdentity,
     ContainmentState,
     ContainmentUnit,
     EnforcementEvidence,
     Enforcer,
     SandboxSpec,
+    SurvivorScan,
     TerminationOutcome,
 )
+from ..declared import require_honourable
 from ..procfs import (
     catches_signal,
     child_pids,
+    descendants_of,
     filesystem_type,
-    find_processes_in_namespace,
     namespace_inode,
     pid_exists,
+    process_start_time,
     read_cgroup,
     read_namespaces,
     read_network_interfaces,
     read_network_routes,
     read_status,
+    snapshot,
 )
 
 __all__ = ["NamespaceEnforcer"]
@@ -134,6 +139,14 @@ class NamespaceEnforcer(Enforcer):
     def prepare(self, profile, spec: "SandboxSpec | None" = None) -> None:
         self.require_available()
         profile.validate()
+        # A declared setting this backend cannot honour must stop the session
+        # here, before anything is launched, rather than being discovered from a
+        # digest that claims it was enforced.
+        require_honourable(
+            profile,
+            self.backend_name,
+            allow_reduced_protection=profile.allow_reduced_protection,
+        )
 
         caps = self.capabilities
         problems: list[str] = []
@@ -392,6 +405,29 @@ class NamespaceEnforcer(Enforcer):
             )
 
         unit.refresh_namespaces()
+
+        # Record the launch-time identity ONCE, from the live sandbox process.
+        # Everything later that asks "is the unit gone?" answers against this,
+        # not against a fresh read of a pid that may already be dead: an
+        # identity the workload can erase by exiting is not an identity.
+        unit.identity = ContainmentIdentity(
+            launcher_pid=pid,
+            launcher_start_time=process_start_time(pid),
+            sandbox_pid=sandbox_pid,
+            sandbox_start_time=process_start_time(sandbox_pid),
+            namespaces=unit.namespaces,
+            # Cgroup membership is deliberately NOT recorded here. This backend
+            # does not create a per-unit cgroup, so whatever /proc reports is the
+            # *ambient* cgroup the supervisor is in too - a systemd user slice,
+            # or `/` when a cgroup namespace is in play. Matching on that would
+            # report every process in the slice as a unit survivor. A cgroup is
+            # only an identity when the backend created it, so until the cgroup
+            # phase lands this stays None and the scan skips the layer.
+            cgroup=None,
+            recorded_at=int(time.time()),
+        )
+        unit.metadata["identity"] = unit.identity.to_dict()
+
         unit.state = ContainmentState.RUNNING
         return unit
 
@@ -758,8 +794,22 @@ class NamespaceEnforcer(Enforcer):
             )
 
         status = read_status(pid)
-        namespaces = read_namespaces(pid)
-        unit.namespaces = namespaces
+        observed = read_namespaces(pid)
+        # Never let a read of a dead or recycled pid blank the unit's identity.
+        # That was the fail-open bug: after the workload exited, ``inspect``
+        # replaced the recorded namespaces with an empty set, and the emptiness
+        # check then found "no namespace to look for" and reported the sandbox
+        # as empty even when descendants were still running.
+        if observed.values:
+            unit.namespaces = observed
+            if unit.identity is not None and not unit.identity.namespaces.values:
+                unit.identity = replace(unit.identity, namespaces=observed)
+        namespaces = unit.namespaces
+        if not observed.values:
+            problems.append(
+                "the workload's namespaces could not be read from the host, so "
+                "its containment could not be confirmed"
+            )
 
         uid_on_host = None
         if status.get("Uid"):
@@ -817,7 +867,12 @@ class NamespaceEnforcer(Enforcer):
                     f"unexpected network interfaces inside the sandbox: {interfaces}"
                 )
         else:
-            problems.append(
+            # ``open`` is a *declared posture*, not a containment failure. It
+            # provides no egress restriction, and that is recorded as reduced
+            # protection - but treating it as a broken sandbox made every
+            # non-``none`` profile impossible to complete, which was a bug
+            # rather than a safety property.
+            unit.metadata.setdefault("network_notes", []).append(
                 "network=open: the sandbox shares the host network namespace, "
                 "so egress is not restricted"
             )
@@ -835,9 +890,7 @@ class NamespaceEnforcer(Enforcer):
 
         limits = report.get("limits") or {}
 
-        survivors = find_processes_in_namespace(
-            unit.user_namespace or "", kind="user" if namespaces.user else "pid"
-        )
+        survivors = list(self.scan_survivors(unit).survivors)
         process_count = max(0, len(survivors))
         evidence = EnforcementEvidence(
             backend=self.backend_name,
@@ -1029,19 +1082,132 @@ class NamespaceEnforcer(Enforcer):
         unit.termination = outcome
         return outcome
 
+    def scan_survivors(self, unit: ContainmentUnit) -> SurvivorScan:
+        """Ask whether any process of the unit survives, using every view available.
+
+        No single namespace inode is a complete identity. A process inside the
+        sandbox can create *child* namespaces - a nested user or PID namespace -
+        and would then carry different inode values while still belonging to the
+        unit. So the scan combines independent layers and reports which one saw
+        what, and it fails closed when it has no identity to work from.
+
+        Layers
+        ------
+        ``pid_namespace``
+            Processes carrying the unit's PID-namespace inode. A process cannot
+            move out of the PID namespace it was created in, and an orphan
+            re-parents to that namespace's init, so this is the strongest single
+            key.
+        ``user_namespace``
+            Processes carrying the unit's user-namespace inode. Catches a
+            descendant that created a nested PID namespace but kept the unit's
+            user namespace.
+        ``ancestry``
+            Live roots (the launcher the supervisor itself spawned, and the
+            sandbox init) plus everything descended from them. Catches a
+            descendant that created *both* a nested user and a nested PID
+            namespace, which neither layer above can see. Roots are re-checked
+            against their recorded ``starttime``, so a recycled pid is not
+            mistaken for the unit.
+        ``cgroup``
+            Cgroup membership, when a cgroup was recorded at launch.
+        """
+        identity = unit.identity
+        namespaces = (
+            identity.namespaces
+            if identity is not None and identity.namespaces.values
+            else unit.namespaces
+        )
+
+        layers: dict[str, Any] = {}
+        if not namespaces.values and (identity is None or not identity.known):
+            layers["identity"] = "unknown"
+            return SurvivorScan(
+                empty=False,
+                identity_known=False,
+                layers=layers,
+                note=(
+                    "the unit has no recorded identity, so it cannot be verified "
+                    "empty; treating it as not empty"
+                ),
+            )
+
+        records = snapshot(exclude={os.getpid()})
+        survivors: set[int] = set()
+
+        if namespaces.pid:
+            hits = [r.pid for r in records if r.pid_ns == namespaces.pid and r.live]
+            layers["pid_namespace"] = {"inode": namespaces.pid, "pids": sorted(hits)}
+            survivors.update(hits)
+
+        if namespaces.user:
+            hits = [r.pid for r in records if r.user_ns == namespaces.user and r.live]
+            layers["user_namespace"] = {"inode": namespaces.user, "pids": sorted(hits)}
+            survivors.update(hits)
+
+        if identity is not None and identity.ancestry_roots:
+            roots = identity.ancestry_roots
+            by_pid = {record.pid: record for record in records}
+            live_roots = [
+                pid
+                for pid, start in roots.items()
+                if pid in by_pid
+                and by_pid[pid].live
+                and (start is None or by_pid[pid].start_time == start)
+            ]
+            hits = descendants_of(roots, records)
+            layers["ancestry"] = {
+                "roots": sorted(roots),
+                "live_roots": sorted(live_roots),
+                "pids": hits,
+            }
+            # The roots count too: the launcher is the supervisor's own child
+            # and belongs to the unit even though it lives in the host PID
+            # namespace.
+            survivors.update(hits)
+            survivors.update(live_roots)
+
+        if identity is not None and identity.cgroup:
+            # A cgroup is only an identity when it is *unit-specific*. The
+            # ambient cgroup the supervisor itself sits in (a systemd user
+            # slice, or `/` under a cgroup namespace) is shared with unrelated
+            # host processes, and matching on it reported pid 1 and other
+            # system processes as unit survivors. Guard against that even if a
+            # backend one day records a cgroup by mistake.
+            own_cgroup = read_cgroup(os.getpid())
+            if own_cgroup and identity.cgroup == own_cgroup:
+                layers["cgroup"] = {
+                    "path": identity.cgroup,
+                    "pids": [],
+                    "skipped": (
+                        "the recorded cgroup is shared with the supervisor, so "
+                        "it does not identify this unit"
+                    ),
+                }
+            else:
+                hits = [
+                    r.pid for r in records if r.cgroup == identity.cgroup and r.live
+                ]
+                layers["cgroup"] = {"path": identity.cgroup, "pids": sorted(hits)}
+                survivors.update(hits)
+
+        return SurvivorScan(
+            empty=not survivors,
+            survivors=tuple(sorted(survivors)),
+            identity_known=True,
+            layers=layers,
+        )
+
     def _unit_processes(self, unit: ContainmentUnit) -> list[int]:
-        namespace = unit.user_namespace
-        if not namespace:
-            # No namespace recorded: fall back to the process group.
-            if unit.host_pid and unit.process is not None and unit.process.alive:
-                return [unit.host_pid]
-            return []
-        kind = "user" if unit.namespaces.user else "pid"
-        return find_processes_in_namespace(namespace, kind=kind)
+        """Live processes belonging to the unit, across every scan layer."""
+        return list(self.scan_survivors(unit).survivors)
 
     def verify_empty(self, unit: ContainmentUnit) -> tuple[bool, list[int]]:
-        survivors = self._unit_processes(unit)
-        return (not survivors), survivors
+        scan = self.scan_survivors(unit)
+        unit.metadata["survivor_scan"] = scan.to_dict()
+        if not scan.identity_known and not unit.metadata.get("identity_note"):
+            unit.metadata["identity_note"] = scan.note
+        return scan.empty, list(scan.survivors)
 
     def _force_kill(self, process: LocalProcess) -> None:
         try:

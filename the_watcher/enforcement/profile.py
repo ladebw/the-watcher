@@ -69,6 +69,7 @@ _PROFILE_KEYS: "frozenset[str]" = frozenset(
         "allow_privileged",
         "allow_dangerous_capabilities",
         "allow_docker_socket",
+        "allow_reduced_protection",
     }
 )
 
@@ -163,6 +164,11 @@ class SyscallPolicy:
     block_kexec: bool = True
     block_swap: bool = True
     block_perf: bool = True
+    #: Deny namespace-creating *flags* on the legacy ``clone`` syscall while
+    #: leaving ``clone`` itself callable, so threads and ordinary process
+    #: creation keep working. Without this, ``clone(CLONE_NEWUSER|…)`` creates
+    #: child namespaces even though ``unshare``/``setns``/``clone3`` are blocked.
+    block_clone_namespaces: bool = True
     errno_name: str = "EPERM"
 
     def to_dict(self) -> dict[str, Any]:
@@ -179,6 +185,7 @@ class SyscallPolicy:
             "block_kexec": self.block_kexec,
             "block_swap": self.block_swap,
             "block_perf": self.block_perf,
+            "block_clone_namespaces": self.block_clone_namespaces,
             "errno_name": self.errno_name,
         }
 
@@ -202,10 +209,16 @@ class ProcessPolicy:
 @dataclass(frozen=True)
 class ResourcePolicy:
     """External ceilings. ``None`` means "not configured", never "unlimited
-    by accident" — the backend records exactly what it applied."""
+    by accident" — the backend records exactly what it applied.
+
+    ``cpus`` defaults to ``None`` deliberately. No backend other than the
+    container runtime can enforce a CPU rate without cgroup v2, so a non-``None``
+    default would put a value in the profile digest that nothing implemented -
+    the exact "declared but not enforced" defect V4 Phase 0 removes.
+    """
 
     memory_mb: "int | None" = 512
-    cpus: "float | None" = 1.0
+    cpus: "float | None" = None
     max_runtime_seconds: "float | None" = None
     max_file_size_mb: int = 256
     max_core_dump_mb: int = 0
@@ -246,6 +259,15 @@ class ContainmentProfile:
     allow_dangerous_capabilities: bool = False
     allow_docker_socket: bool = False
 
+    #: Explicit acknowledgement that the session may run **without** a resource
+    #: control the selected backend cannot apply (for example a CPU ceiling on a
+    #: backend with no cgroup quota). Without it, an explicitly requested but
+    #: unenforceable ceiling is refused before the workload is launched. It never
+    #: covers the settings that describe the trust boundary itself - a network
+    #: mode, capability handling or ``no_new_privs`` - because accepting those
+    #: would mean recording a posture the kernel does not implement.
+    allow_reduced_protection: bool = False
+
     # -- serialisation ---------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,6 +286,7 @@ class ContainmentProfile:
             "allow_privileged": self.allow_privileged,
             "allow_dangerous_capabilities": self.allow_dangerous_capabilities,
             "allow_docker_socket": self.allow_docker_socket,
+            "allow_reduced_protection": self.allow_reduced_protection,
         }
 
     #: Fields that must be tuples. A loaded profile must be *equal* to the
@@ -330,6 +353,9 @@ class ContainmentProfile:
                 payload.get("allow_dangerous_capabilities", False)
             ),
             allow_docker_socket=bool(payload.get("allow_docker_socket", False)),
+            allow_reduced_protection=bool(
+                payload.get("allow_reduced_protection", False)
+            ),
         )
         profile.validate()
         return profile

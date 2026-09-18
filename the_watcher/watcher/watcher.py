@@ -606,6 +606,11 @@ class PoEWatcher:
                 "rule": evaluation.rule,
                 "attempted_event_type": kind,
                 "attempted_action": action,
+                # Which facts the verdict rested on, and how much each was
+                # worth. Recorded so a reader can tell a decision built on host
+                # observation from one built on the workload's own account of
+                # itself.
+                "fact_authority": dict(evaluation.facts),
             },
         )
 

@@ -21,10 +21,13 @@ in ``--inline`` mode, or 137 whenever the kill switch was engaged.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 from typing import Any, Sequence
 
 from . import __version__
@@ -33,6 +36,50 @@ from .watcher import Policy, PoEWatcher
 
 KILLED_EXIT_CODE = 137
 TIMEOUT_EXIT_CODE = 124
+
+
+@contextlib.contextmanager
+def supervisor_signal_handlers(daemon: Any):
+    """Route ``SIGINT``/``SIGTERM`` into a controlled supervisor shutdown.
+
+    The handler does the minimum a signal handler may safely do: it asks the
+    daemon to shut down. The daemon's ordinary supervision loop then performs
+    the real work - the recorded kill, the containment teardown, the seal - on
+    the normal code path, under the normal lock. Asynchronous cleanup inside the
+    handler frame is deliberately avoided.
+
+    Handlers are installed only in the main thread of the process that owns the
+    daemon, because ``signal.signal`` is not permitted anywhere else; every
+    failure to install is ignored rather than fatal, so behaviour on platforms
+    with partial signal support (notably Windows, where ``SIGTERM`` is not
+    delivered by ``TerminateProcess``) is unchanged.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _handler(signum: int, _frame: Any) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:  # pragma: no cover - platform specific
+            name = str(signum)
+        daemon.request_shutdown(f"SIGNAL:{name}")
+
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[signum] = signal.signal(signum, _handler)
+        except (ValueError, OSError, AttributeError):  # pragma: no cover
+            continue
+
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):  # pragma: no cover
+                continue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -256,6 +303,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the backend keeps guard copies and reports (default: a temp dir)",
     )
     run.add_argument(
+        "--allow-reduced-protection",
+        action="store_true",
+        help=(
+            "accept running without a requested resource control the backend "
+            "cannot enforce (e.g. --cpus on a backend with no cgroup quota). "
+            "Without this, such a request is refused before launch. The waiver "
+            "is recorded in the Proof of Execution."
+        ),
+    )
+    run.add_argument(
         "protected_command",
         nargs=argparse.REMAINDER,
         metavar="-- COMMAND [ARGS...]",
@@ -441,7 +498,8 @@ def _cmd_run_v2(
     )
 
     daemon = WatcherDaemon(config)
-    exit_code = daemon.run()
+    with supervisor_signal_handlers(daemon):
+        exit_code = daemon.run()
 
     if daemon.internal_error:
         print(f"watcher supervisor error: {daemon.internal_error}", file=sys.stderr)
@@ -565,6 +623,12 @@ def _build_containment_profile(args: argparse.Namespace):
             processes=dataclasses.replace(profile.processes, max_processes=pids),
         )
 
+    if getattr(args, "allow_reduced_protection", False):
+        # An explicit, recorded acknowledgement that the session may run without
+        # a requested resource control this backend cannot apply. It is part of
+        # the profile, so it is covered by the profile digest.
+        profile = dataclasses.replace(profile, allow_reduced_protection=True)
+
     # A refused profile is a configuration error, reported before anything is
     # started: an unsafe profile is never silently "adjusted".
     profile.validate()
@@ -592,6 +656,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"profile: {profile.name}")
         print(profile.summary())
         print(f"digest:  {profile.digest()}")
+        _print_enforcement_report(profile)
 
     enforce_ok = caps.enforced_mode_available
     if not args.json and enforce_ok:
@@ -646,6 +711,36 @@ def _probe_workspace_enforceable(workspace: str) -> tuple[bool, str]:
     from .enforcement.linux import landlock_ruleset
 
     return landlock_ruleset.probe_path_access(workspace)
+
+
+def _print_enforcement_report(profile: Any) -> None:
+    """Print what the backend will actually enforce, not just what was declared.
+
+    A profile is a declaration; the digest hashes the declaration. This section
+    is the honest counterpart: which parts of the declaration the selected
+    backend really applies, and which it does not.
+    """
+    from .enforcement import enforcement_report, report_summary
+
+    backend = str(profile.backend or "auto")
+    if backend == "auto":
+        from .enforcement.capabilities import detect_capabilities
+
+        available = tuple(detect_capabilities().available_backends)
+        backend = available[0] if available else "namespaces"
+
+    report = enforcement_report(profile, backend)
+    counts = report_summary(report)["counts"]
+    print()
+    print(f"enforcement report (backend: {backend})")
+    notable = [entry for entry in report if entry.status.value != "ENFORCED"]
+    if not notable:
+        print("  every declared setting is enforced by this backend")
+    for entry in notable:
+        print(f"  {entry.status.value:<20} {entry.field}")
+        if entry.detail:
+            print(f"      {entry.detail}")
+    print("  counts: " + ", ".join(f"{name}={counts[name]}" for name in sorted(counts)))
 
 
 def cmd_status(args: argparse.Namespace) -> int:

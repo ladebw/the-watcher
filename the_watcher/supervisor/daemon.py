@@ -34,6 +34,7 @@ from __future__ import annotations
 import enum
 import os
 import secrets
+import subprocess
 import threading
 import time
 import uuid
@@ -54,8 +55,11 @@ from ..enforcement import (
     ContainmentState,
     EnforcementMode,
     SandboxSpec,
+    enforcement_report,
     get_preset,
+    report_summary,
     select_backend,
+    unsupported_summary,
 )
 from ..ipc.client import (
     ENV_ENDPOINT,
@@ -81,6 +85,11 @@ from ..ipc.transport import IpcListener, LocalEndpoint, create_endpoint
 from ..poe import EventType
 from ..poe.event import as_text
 from ..watcher.decision import Decision, Risk
+from ..watcher.authority import (
+    AUTHORITATIVE_NAMESPACE,
+    AuthoritativeFacts,
+    client_forged_reserved_namespace,
+)
 from ..watcher.policy import Policy
 from ..watcher.tripwire import TripwireRegistry
 from ..watcher.watcher import PoEWatcher
@@ -236,6 +245,10 @@ class WatcherDaemon:
         self._token: str = ""
         self._lock = threading.RLock()
         self._quit = threading.Event()
+        #: Set by :meth:`request_shutdown` (including from a signal handler).
+        #: The supervision loop turns it into an ordinary, recorded kill.
+        self._shutdown_requested = False
+        self._shutdown_reason = ""
         self._started = False
         self._finalised = False
         #: Set under ``_lock`` as the first act of finalisation. Any thread
@@ -530,15 +543,24 @@ class WatcherDaemon:
     def _record_containment_prepared(self) -> None:
         profile = self._config.containment
         assert profile is not None and self._enforcer is not None
+        backend = self._enforcer.backend_name
+        # The digest describes what was *declared*. This report describes what
+        # the selected backend actually enforces, so the two are recorded
+        # together and a digest can never stand alone as a claim of enforcement.
+        report = enforcement_report(profile, backend)
+        summary = report_summary(report)
+        unhonoured_declared = unsupported_summary(profile, backend)[
+            "declared_but_unhonoured"
+        ]
         self._record(
             EventType.CONTAINMENT_PREPARED,
             action="prepare",
-            resource=self._enforcer.backend_name,
+            resource=backend,
             decision=Decision.ALLOW,
-            risk=Risk.NORMAL,
+            risk=Risk.HIGH if unhonoured_declared else Risk.NORMAL,
             reason="containment backend selected and validated",
             metadata={
-                "backend": self._enforcer.backend_name,
+                "backend": backend,
                 "profile": profile.name,
                 "profile_digest": profile.digest(),
                 "profile_summary": profile.summary(),
@@ -547,6 +569,12 @@ class WatcherDaemon:
                 "landlock_required": profile.filesystem.landlock_required,
                 "max_processes": profile.processes.max_processes,
                 "memory_mb": profile.resources.memory_mb,
+                "enforcement_report": summary,
+                "declared_but_unhonoured": unhonoured_declared,
+                "reduced_protection": bool(
+                    profile.is_reduced_protection or unhonoured_declared
+                ),
+                "allow_reduced_protection": profile.allow_reduced_protection,
             },
         )
 
@@ -920,8 +948,41 @@ class WatcherDaemon:
             self._check_session_timeout()
             self._quit.wait(self._config.monitor_interval)
 
+        # A stop was requested. If it came from a signal handler it has not
+        # killed anything yet - the handler only set the flag - so the
+        # controlled shutdown happens here, on the normal path, with the
+        # normal lock and the normal kill accounting.
+        self._perform_requested_shutdown()
+
         code = self._process.poll()
         return int(code) if code is not None else 1
+
+    def _perform_requested_shutdown(self) -> None:
+        """Turn a shutdown request into an ordinary, recorded kill.
+
+        ``stop`` already kills under the lock, so this only has work to do when
+        the request came from somewhere that must not do real work - a signal
+        handler calling :meth:`request_shutdown`. A workload that has already
+        exited is left alone; finalisation records its real status.
+        """
+        if not self._shutdown_requested:
+            return
+        state = self._workload_state()
+        if not state["started"] or not state["alive"]:
+            return
+        with self._lock:
+            if self._shutting_down or self.killed:
+                return
+            self._record(
+                EventType.SHUTDOWN_REQUESTED,
+                action="shutdown",
+                resource=str(self._process.pid) if self._process else "",
+                decision=Decision.KILL,
+                risk=Risk.HIGH,
+                reason=f"controlled shutdown requested: {self._shutdown_reason or 'unspecified'}",
+                metadata={"requested_reason": self._shutdown_reason, "source": "signal"},
+            )
+            self._kill_locked(self._shutdown_reason or "SHUTDOWN_REQUESTED")
 
     def _record_vanished_client(self) -> None:
         """Record a client that exited without saying goodbye.
@@ -1360,6 +1421,14 @@ class WatcherDaemon:
         with self._lock:
             if rejected:
                 self._record_rejected_fields(rejected, context)
+            # A client that supplies the reserved authoritative namespace is
+            # trying to write the supervisor's own facts. It cannot take
+            # effect - the supervisor overwrites it below - but the attempt is
+            # recorded rather than silently dropped.
+            if client_forged_reserved_namespace(metadata):
+                self._record_rejected_fields(
+                    [f"metadata.{AUTHORITATIVE_NAMESPACE}"], context
+                )
             return {
                 "event_type": event_type,
                 "action": action,
@@ -1371,8 +1440,33 @@ class WatcherDaemon:
                         "client_pid": context.client_pid,
                         "kind": kind,
                     },
+                    # Written last, so nothing the client sent can survive here.
+                    AUTHORITATIVE_NAMESPACE: self._authoritative_facts(
+                        event_type, resource
+                    ).to_metadata(),
                 },
             }
+
+    def _authoritative_facts(self, event_type: str, resource: str) -> AuthoritativeFacts:
+        """The facts the supervisor observed for one request.
+
+        Only what the supervisor can genuinely establish is included. The
+        process-tree size is measured only for ``process_creation`` events,
+        because it costs a ``/proc`` walk and no other rule consumes it.
+        """
+        process_count: "int | None" = None
+        if event_type == EventType.PROCESS_CREATION.value and self._process is not None:
+            if self._process.started:
+                process_count = self._process.process_count()
+        runtime_seconds: "int | None" = None
+        if self._started_at is not None:
+            runtime_seconds = max(0, int(self._clock()) - self._started_at)
+        return AuthoritativeFacts(
+            resource=resource,
+            process_count=process_count,
+            runtime_seconds=runtime_seconds,
+            session_state=self._state.state.value,
+        )
 
     def _record_rejected_fields(
         self, rejected: Sequence[str], context: ClientContext
@@ -1536,6 +1630,229 @@ class WatcherDaemon:
 
     # -- finalisation ----------------------------------------------------
 
+    #: How long finalisation waits for a workload it has terminated to
+    #: actually disappear before declaring the termination unverified. Bounded
+    #: so a wedged process cannot hang the session, and exceeded only as an
+    #: explicitly recorded, critical failure.
+    FINALIZATION_VERIFY_TIMEOUT = 5.0
+
+    def _workload_state(self) -> dict[str, Any]:
+        """What the supervisor can observe about the workload right now.
+
+        ``alive`` is the kernel's answer (``poll()``), never a cached belief.
+        """
+        process = self._process
+        if process is None or not process.started:
+            return {"started": False, "alive": False, "returncode": None}
+        code = process.poll()
+        return {"started": True, "alive": code is None, "returncode": code}
+
+    def _ensure_workload_stopped(self) -> dict[str, Any]:
+        """Guarantee no protected workload outlives finalisation.
+
+        This is the Phase 0 Blocker A invariant, and it is the *only* place
+        that may decide whether an exit status was observed. Outcomes:
+
+        ``not_started``
+            Nothing was ever launched. No exit was observed, and none is
+            claimed.
+        ``already_exited``
+            ``poll()`` returned a real status. That status is authoritative and
+            may be recorded as an observed exit.
+        ``terminated``
+            The workload was still running, so it was terminated and then
+            verified gone. The signal-derived status is reported, but it is
+            explicitly *not* an observed voluntary exit.
+        ``termination_unverified``
+            The workload was still running and could not be confirmed gone.
+            The caller must treat this as a critical failure and must not write
+            an exit event.
+        """
+        state = self._workload_state()
+
+        if not state["started"]:
+            return {
+                "phase": "not_started",
+                "exit_code": 1,
+                "exit_observed": False,
+                "termination": None,
+                "survivors": [],
+            }
+
+        if not state["alive"]:
+            return {
+                "phase": "already_exited",
+                "exit_code": int(state["returncode"] or 0),
+                "exit_observed": True,
+                "termination": None,
+                "survivors": [],
+            }
+
+        # The workload outlived the reason we are finalising. Record the
+        # request and the initiation *before* doing anything, so the trace
+        # shows a deliberate stop rather than an unexplained disappearance.
+        pid = self._process.pid if self._process is not None else None
+        self._record(
+            EventType.SHUTDOWN_REQUESTED,
+            action="shutdown",
+            resource=str(pid) if pid is not None else "",
+            decision=Decision.KILL,
+            risk=Risk.HIGH,
+            reason=(
+                "finalisation was reached while the protected workload was "
+                "still running"
+            ),
+            metadata={
+                "phase": "finalization",
+                "pid": pid,
+                "kill_switch_engaged": self.killed,
+                "requested_reason": self._shutdown_reason or None,
+                "observed_alive": True,
+            },
+        )
+        self._record(
+            EventType.TERMINATION_INITIATED,
+            action="terminate_workload",
+            resource=str(pid) if pid is not None else "",
+            decision=Decision.KILL,
+            risk=Risk.HIGH,
+            reason="terminating the protected workload before the trace is sealed",
+            metadata={
+                "pid": pid,
+                "grace_seconds": self._config.termination_grace,
+                "contained": self._unit is not None,
+            },
+        )
+
+        termination, survivors, verified = self._terminate_workload_now()
+        process = self._process
+        reported = process.poll() if process is not None else None
+
+        if verified:
+            self._record(
+                EventType.TERMINATION_VERIFIED,
+                action="verify_termination",
+                resource=str(pid) if pid is not None else "",
+                decision=Decision.KILL,
+                risk=Risk.HIGH,
+                reason="the protected workload was observed to be gone",
+                metadata={
+                    "termination": termination,
+                    "survivors": list(survivors),
+                    "exit_observed": False,
+                    "status_after_termination": reported,
+                },
+            )
+            # The workload did not exit on its own, so this is a failure rather
+            # than an exit status. The raw status the kernel reported for the
+            # terminated process (typically a signal) is kept in the event
+            # metadata above, never presented as a voluntary exit code.
+            return {
+                "phase": "terminated",
+                "exit_code": 1,
+                "exit_observed": False,
+                "termination": termination,
+                "survivors": [],
+            }
+
+        # Could not confirm the workload is gone. This is the one outcome that
+        # must never be softened, and the caller must not record an exit.
+        self._record(
+            EventType.TERMINATION_UNVERIFIED,
+            action="verify_termination",
+            resource=str(pid) if pid is not None else "",
+            decision=Decision.KILL,
+            risk=Risk.CRITICAL,
+            reason=(
+                "the protected workload could not be confirmed gone after "
+                "termination; this session did NOT verify its containment"
+            ),
+            metadata={
+                "termination": termination,
+                "survivors": list(survivors),
+                "verify_timeout_seconds": self.FINALIZATION_VERIFY_TIMEOUT,
+            },
+        )
+        if not self._internal_error:
+            self._internal_error = (
+                "workload termination could not be verified; "
+                f"survivors={list(survivors)}"
+            )
+        return {
+            "phase": "termination_unverified",
+            "exit_code": 1,
+            "exit_observed": False,
+            "termination": termination,
+            "survivors": list(survivors),
+        }
+
+    def _terminate_workload_now(self) -> tuple[dict[str, Any], list[int], bool]:
+        """Terminate the live workload and verify it. Returns (detail, survivors, verified).
+
+        Containment units are destroyed through the enforcer, which already
+        isolates the network, terminates the whole unit and proves emptiness.
+        A merely supervised (V2) workload is terminated through the supervisor's
+        own process handle and then *waited on*, which is the deterministic
+        primitive for "this child is gone" - no polling loop and no sleep is
+        used as synchronisation.
+        """
+        if self._unit is not None:
+            self._destroy_unit(reason="FINALIZATION_WORKLOAD_ALIVE")
+            detail = dict(self._containment_termination or {})
+            survivors = [int(pid) for pid in (detail.get("survivors") or [])]
+            return detail, survivors, bool(detail.get("empty"))
+
+        process = self._process
+        if process is None or not process.started:
+            return {}, [], True
+
+        try:
+            report = process.terminate(grace=self._config.termination_grace)
+        except Exception as exc:  # noqa: BLE001 - reported as an unverified kill
+            return ({"error": f"{type(exc).__name__}: {exc}"}, [], False)
+
+        detail = report.to_dict()
+        failed = [int(pid) for pid in report.failed]
+
+        # ``wait`` is the authoritative confirmation that our own child is
+        # gone. A timeout means exactly that: we could not confirm it.
+        verified = False
+        try:
+            process.wait(timeout=self.FINALIZATION_VERIFY_TIMEOUT)
+            verified = True
+        except subprocess.TimeoutExpired:
+            verified = False
+        except Exception as exc:  # noqa: BLE001
+            detail["wait_error"] = f"{type(exc).__name__}: {exc}"
+
+        if not verified and process.poll() is not None:
+            verified = True
+
+        # A tree member the kill could not signal means the tree is not
+        # confirmed gone, even when our direct child is.
+        if failed:
+            verified = False
+            for pid in failed:
+                if pid not in detail.setdefault("survivors", []):
+                    detail["survivors"].append(pid)
+
+        return detail, failed, verified
+
+    def request_shutdown(self, reason: str = "SHUTDOWN_REQUESTED") -> None:
+        """Ask for a controlled shutdown. Safe to call from a signal handler.
+
+        This deliberately does almost nothing: it records *why* a stop was
+        asked for and wakes the supervision loop, which then performs the
+        ordinary kill-and-record path under the normal lock. Doing real work
+        (terminating processes, writing the trace) inside a signal handler
+        frame is how asynchronous cleanup bugs are born, so it is not done
+        here.
+        """
+        if reason and not self._shutdown_reason:
+            self._shutdown_reason = str(reason)
+        self._shutdown_requested = True
+        self._quit.set()
+
     def _finalize(self, exit_code: int) -> None:
         # Claim finalisation under the daemon lock before anything else. Every
         # path that could append to the trace takes this lock and checks
@@ -1551,16 +1868,37 @@ class WatcherDaemon:
                 return
             self._finalised = True
             self._shutting_down = True
-        self._exit_code = exit_code
 
         watcher = self._watcher
         process = self._process
 
+        # 0. Invariant: no session is finalised or sealed as having exited if
+        #    its protected workload is still alive. Finalisation is reached by
+        #    paths that did not necessarily observe an exit: a supervisor
+        #    exception, a keyboard interrupt, a signal, or a stop request that
+        #    could not kill. The liveness of the workload is therefore
+        #    established here, and a live workload is terminated and verified
+        #    before any lifecycle event is written.
+        stop = self._ensure_workload_stopped()
+        exit_code = int(stop["exit_code"])
+        self._exit_code = exit_code
+
         # 1. Decide the terminal state.
-        if watcher is not None and watcher.killed:
+        if stop["phase"] == "termination_unverified":
+            # Protected processes may still be running. That is never a clean
+            # or a killed session: it is a failure, and it is stated as one.
+            self._state.transition_quiet(
+                SessionState.FAILED, "workload termination could not be verified"
+            )
+        elif watcher is not None and watcher.killed:
             self._state.transition_quiet(SessionState.KILLED, "kill switch engaged")
-        elif exit_code == 0:
+        elif exit_code == 0 and stop["exit_observed"]:
             self._state.transition_quiet(SessionState.COMPLETED, "process exited cleanly")
+        elif exit_code == 0:
+            # A clean code that was never observed is not a clean finish.
+            self._state.transition_quiet(
+                SessionState.FAILED, "no exit status was observed for the workload"
+            )
         else:
             self._state.transition_quiet(
                 SessionState.FAILED, f"process exited with {exit_code}"
@@ -1573,9 +1911,10 @@ class WatcherDaemon:
             self._stop_ipc()
             return
 
-        # The workload has exited. Destroy the containment unit and prove it
-        # is empty before the trace is sealed, so the final record describes a
-        # machine state in which nothing from the sandbox is still running.
+        # The workload has exited, or has been terminated and verified gone.
+        # Destroy the containment unit and prove it is empty before the trace
+        # is sealed, so the final record describes a machine state in which
+        # nothing from the sandbox is still running.
         self._destroy_unit(reason="SESSION_ENDED")
 
         # 2. Stop the IPC writers before anything else is recorded or sealed.
@@ -1590,29 +1929,35 @@ class WatcherDaemon:
         # had their say first, and only a genuinely lost client is flagged.
         self._record_vanished_client()
 
-        # 3. Lifecycle events.
-        self._record(
-            EventType.PROCESS_EXITED,
-            action="exit",
-            resource=" ".join(process.command) if process is not None else "",
-            decision=Decision.KILL if watcher.killed else Decision.ALLOW,
-            risk=Risk.CRITICAL if watcher.killed else Risk.NORMAL,
-            reason=f"protected process exited with {exit_code}",
-            metadata={
-                "exit_code": exit_code,
-                "pid": process.pid if process is not None else None,
-                "duration_seconds": round(process.duration_seconds, 3)
-                if process is not None
-                else 0.0,
-            },
-        )
+        # 3. Lifecycle events. ``PROCESS_EXITED`` asserts an observation, so it
+        #    is written only when an exit was actually observed. A workload the
+        #    supervisor had to terminate gets the termination vocabulary
+        #    instead - never a fabricated exit status.
+        if stop["exit_observed"]:
+            self._record(
+                EventType.PROCESS_EXITED,
+                action="exit",
+                resource=" ".join(process.command) if process is not None else "",
+                decision=Decision.KILL if watcher.killed else Decision.ALLOW,
+                risk=Risk.CRITICAL if watcher.killed else Risk.NORMAL,
+                reason=f"protected process exited with {exit_code}",
+                metadata={
+                    "exit_code": exit_code,
+                    "pid": process.pid if process is not None else None,
+                    "duration_seconds": round(process.duration_seconds, 3)
+                    if process is not None
+                    else 0.0,
+                    "exit_observed": True,
+                },
+            )
 
         self._record(
             EventType.SESSION_END,
             action="end",
             resource=" ".join(process.command) if process is not None else "",
-            decision=Decision.KILL if watcher.killed else Decision.ALLOW,
-            risk=Risk.CRITICAL if watcher.killed else Risk.NORMAL,
+            decision=Decision.KILL if self.killed else Decision.ALLOW,
+            risk=Risk.CRITICAL if (self.killed or stop["phase"] != "already_exited")
+            else Risk.NORMAL,
             reason=(
                 f"session killed: {watcher.kill_record.reason}"
                 if watcher.killed and watcher.kill_record
@@ -1621,6 +1966,9 @@ class WatcherDaemon:
             metadata={
                 "status": self._state.state.value,
                 "exit_code": exit_code,
+                "exit_observed": stop["exit_observed"],
+                "finalization_phase": stop["phase"],
+                "workload_survivors": list(stop["survivors"]),
                 "duration_seconds": round(
                     (int(self._clock()) - self._started_at), 3
                 )
@@ -1631,14 +1979,16 @@ class WatcherDaemon:
 
         # 4. Seal: after this, nothing may be appended. The trace enforces
         #    that itself now, so a straggler write raises rather than quietly
-        #    invalidating the declared final hash.
+        #    invalidating the declared final hash. The seal event must be
+        #    written *before* the seal, so its count describes the trace as it
+        #    will be after this event lands rather than one event short.
         self._record(
             EventType.TRACE_SEALED,
             action="seal",
             decision=Decision.ALLOW,
             risk=Risk.NORMAL,
             reason="trace sealed by the external supervisor",
-            metadata={"event_count": len(watcher.trace)},
+            metadata={"event_count": len(watcher.trace) + 1},
         )
         watcher.seal()
 

@@ -93,6 +93,20 @@ class EventType(str, enum.Enum):
     CONTAINMENT_VERIFIED_EMPTY = "containment_verified_empty"
     KILL_FAILED = "kill_failed"
 
+    # -- V4 Phase 0: truthful shutdown/termination vocabulary -------------
+    #: The supervisor is stopping (or was signalled) while the workload was
+    #: still running. Recorded *before* anything is terminated, so a trace
+    #: always shows that the stop was requested rather than inferred.
+    SHUTDOWN_REQUESTED = "shutdown_requested"
+    #: Termination of a still-running workload has begun.
+    TERMINATION_INITIATED = "termination_initiated"
+    #: The workload was observed to be gone after termination. Only ever
+    #: recorded when the supervisor actually observed the absence.
+    TERMINATION_VERIFIED = "termination_verified"
+    #: Termination could not be confirmed. Critical: the trace must not then
+    #: assert an exit that was never observed.
+    TERMINATION_UNVERIFIED = "termination_unverified"
+
 
 EVENT_TYPES: tuple[str, ...] = tuple(member.value for member in EventType)
 

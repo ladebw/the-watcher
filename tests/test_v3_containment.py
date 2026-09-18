@@ -24,6 +24,7 @@ from conftest import (
     BYPASS_AGENT,
     requires_enforcement,
     run_contained,
+    wait_for,
 )
 
 # Marked ``v3`` as well as conditionally skipped: the marker is what lets the
@@ -635,6 +636,424 @@ def test_isolate_network_reports_the_verified_state(contained):
 
 
 # ---------------------------------------------------------------------------
+# 34b. Adversarial descendant: a child that changes its namespaces
+# ---------------------------------------------------------------------------
+
+#: Forks, and in the child attempts to create child namespaces so that the
+#: descendant no longer carries the unit's namespace inode values. Records what
+#: the kernel said, then both processes stay alive long enough to be observed.
+_ADVERSARY = r'''
+import ctypes, json, os, pathlib, sys, time
+
+CLONE_NEWNS = 0x00020000
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNET = 0x40000000
+CLONE_NEWPID = 0x20000000
+
+libc = ctypes.CDLL(None, use_errno=True)
+out = pathlib.Path(sys.argv[1])
+
+pid = os.fork()
+if pid == 0:
+    results = {}
+    for name, flag in (
+        ("user", CLONE_NEWUSER),
+        ("pid", CLONE_NEWPID),
+        ("mnt", CLONE_NEWNS),
+        ("net", CLONE_NEWNET),
+    ):
+        ctypes.set_errno(0)
+        rc = libc.unshare(ctypes.c_int(flag))
+        results[name] = {"rc": rc, "errno": ctypes.get_errno()}
+    out.write_text(json.dumps({"child_pid": os.getpid(), "unshare": results}))
+    time.sleep(30)
+    os._exit(0)
+
+time.sleep(30)
+'''
+
+
+def test_a_descendant_that_changes_namespaces_is_still_found(
+    enforcer_factory, containment_workspace
+):
+    """A child cannot become invisible by creating its own namespaces.
+
+    The escape this guards against: a descendant calls ``unshare`` to get a
+    child user/PID namespace, after which its ``ns/user`` and ``ns/pid`` inode
+    values differ from the unit's. A scan keyed on a single inode would then
+    report the sandbox as empty while the process was still running.
+
+    Two outcomes are acceptable, and both are asserted rather than assumed:
+
+    * the kernel refuses the ``unshare`` (seccomp blocks namespace
+      manipulation), which is the primary defence; or
+    * it succeeds, and the layered scan still finds the child - by PID
+      namespace, by user namespace, or by ancestry.
+    """
+    from the_watcher.enforcement import SandboxSpec
+
+    enforcer, profile = enforcer_factory()
+    script = containment_workspace / "adversary.py"
+    script.write_text(_ADVERSARY, encoding="utf-8")
+    marker = containment_workspace / "adversary.json"
+
+    spec = SandboxSpec(
+        command=(sys.executable, str(script), str(marker)),
+        profile=profile,
+        workspace_host=str(containment_workspace),
+        cwd_inner=str(containment_workspace),
+        unit_key="adversary",
+    )
+    enforcer.prepare(profile, spec)
+    unit = enforcer.launch(spec)
+    enforcer_factory.units.append((enforcer, unit))
+
+    assert wait_for(lambda: marker.exists(), timeout=30), (
+        "the adversarial workload never reported; guard log: "
+        + str((unit.metadata.get("guard_report") or {}).get("problems"))
+    )
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    attempted = payload["unshare"]
+    succeeded = [name for name, result in attempted.items() if result["rc"] == 0]
+
+    scan = enforcer.scan_survivors(unit)
+    assert scan.empty is False, (
+        "the unit was reported empty while the workload and its child ran: "
+        f"{scan.to_dict()}"
+    )
+    assert len(scan.survivors) >= 2, (
+        "the forked descendant was invisible to the survivor scan: "
+        f"{scan.to_dict()}"
+    )
+    if succeeded:
+        # Namespaces really did change, so at least one independent layer must
+        # have caught the child.
+        assert scan.layers["ancestry"]["pids"], (
+            f"a descendant changed namespaces ({succeeded}) and only the "
+            f"ancestry layer could see it, but it saw nothing: {scan.to_dict()}"
+        )
+
+    enforcer.terminate(unit, grace=1.0)
+    empty, survivors = enforcer.verify_empty(unit)
+    assert empty, f"processes survived termination: {survivors}"
+
+
+def test_verify_empty_fails_closed_without_a_recorded_identity(contained):
+    """An unverifiable unit must never be reported as empty."""
+    run = contained("workspace")
+    # Erase the identity the way a stale read used to, and prove the check
+    # refuses to reassure.
+    run.unit.identity = None
+    from the_watcher.enforcement.procfs import NamespaceIds
+
+    run.unit.namespaces = NamespaceIds(values={})
+    empty, survivors = run.enforcer.verify_empty(run.unit)
+    assert empty is False
+    assert survivors == []
+    scan = run.unit.metadata.get("survivor_scan") or {}
+    assert scan.get("identity_known") is False
+
+
+# ---------------------------------------------------------------------------
+# 34c. Which enforcement stops which namespace primitive
+# ---------------------------------------------------------------------------
+
+PROBE = str(Path(__file__).resolve().parents[1] / "diagnostics" / "probe_namespace_primitives.py")
+
+
+def _read_json_when_complete(path, timeout: float = 60.0):
+    """Read a JSON file the contained workload is still writing.
+
+    The file is created by ``open(..., "w")`` and only then written, so a
+    poller that checks existence alone can read an empty file. Retrying until
+    it parses is the correct handshake for a file-based channel.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = "not attempted"
+    while time.monotonic() < deadline:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(0.1)
+    raise AssertionError(f"{path} never contained complete JSON ({last_error})")
+
+
+def _run_probe_in_sandbox(enforcer, profile, workspace, extra_args, marker_name):
+    """Run the namespace probe as the contained workload and return its output."""
+    from the_watcher.enforcement import SandboxSpec
+
+    probe = Path(workspace) / "probe_namespace_primitives.py"
+    probe.write_text(Path(PROBE).read_text(encoding="utf-8"), encoding="utf-8")
+    marker = Path(workspace) / marker_name
+    if marker.exists():
+        marker.unlink()
+
+    spec = SandboxSpec(
+        command=(sys.executable, str(probe), *extra_args),
+        profile=profile,
+        workspace_host=str(workspace),
+        cwd_inner=str(workspace),
+        unit_key=f"probe-{marker_name}",
+    )
+    enforcer.prepare(profile, spec)
+    unit = enforcer.launch(spec)
+    return unit, marker
+
+
+def test_every_namespace_primitive_is_denied_inside_the_sandbox(
+    enforcer_factory, containment_workspace
+):
+    """Name the exact enforcement behind each namespace primitive.
+
+    ``unshare``, ``setns`` and ``clone3`` are denied outright by the seccomp
+    denylist. The legacy ``clone`` syscall cannot be denied outright - Python
+    threads and every ordinary subprocess go through it - so it is denied
+    *conditionally*, on its flags argument. All four must now return ``EPERM``
+    from inside the sandbox.
+    """
+    enforcer, profile = enforcer_factory()
+    report = Path(containment_workspace) / "primitives.json"
+    unit, _ = _run_probe_in_sandbox(
+        enforcer, profile, containment_workspace, ("--json", str(report), "--hold", "3"), "primitives"
+    )
+    enforcer_factory.units.append((enforcer, unit))
+    assert wait_for(report.exists, timeout=60), (
+        "the probe produced no output; guard log tail: "
+        + str((unit.metadata.get("guard_report") or {}).get("problems"))
+    )
+    findings = _read_json_when_complete(report)
+
+    # The filter really is active, so a denied primitive is denied by seccomp
+    # and not merely by the kernel's privilege rules. The control is the
+    # user-namespace case: `unshare(CLONE_NEWUSER)` succeeds on this host
+    # outside a sandbox (see the probe's standalone output), so an EPERM here
+    # can only come from the filter.
+    assert findings["seccomp_mode"] == 2, findings
+
+    for name in ("unshare_newuser", "unshare_newpid", "unshare_newns"):
+        entry = findings["primitives"][name]
+        assert entry["attempted"] is True, name
+        assert entry["ok"] is False, f"{name} unexpectedly succeeded: {entry}"
+        assert entry["errno_name"] == "EPERM", (
+            f"{name} failed with {entry['errno_name']}, so it is not the seccomp "
+            f"filter that stopped it: {entry}"
+        )
+
+    # clone3 is refused too, but deliberately with ENOSYS rather than EPERM.
+    # glibc's __clone_internal falls back to the legacy clone syscall *only*
+    # when clone3 reports ENOSYS; returning EPERM made pthread_create fail
+    # inside the sandbox with "can't start new thread". This host's kernel
+    # supports clone3 (the probe's standalone run succeeds), so an ENOSYS here
+    # can only come from the filter.
+    clone3 = findings["primitives"]["clone3"]
+    assert clone3["attempted"] is True
+    assert clone3["ok"] is False, f"clone3 unexpectedly succeeded: {clone3}"
+    assert clone3["errno_name"] == "ENOSYS", (
+        "clone3 must report ENOSYS so that runtimes fall back to the legacy "
+        f"clone path, which is guarded separately: {clone3}"
+    )
+
+    # The gap this closes: legacy clone with namespace flags.
+    nested = findings["primitives"]["legacy_clone_nested"]
+    if nested.get("errno_name") == "ENOSYS":
+        pytest.skip(
+            "this architecture has no machine-code child stub, so the legacy "
+            "clone attempt cannot be made here (reported as a limitation)"
+        )
+    assert nested["ok"] is False, (
+        "legacy clone with namespace flags still succeeded inside the sandbox: "
+        f"{nested}"
+    )
+    assert nested["errno_name"] == "EPERM", (
+        "legacy clone was refused by something other than the seccomp filter: "
+        f"{nested}"
+    )
+    assert nested["child_pid"] is None, "a nested child was created anyway"
+
+    # And the filter is reported, so the trace shows the rule in force.
+    report_data = unit.metadata.get("guard_report") or {}
+    seccomp = report_data.get("seccomp") or {}
+    assert "clone" not in (seccomp.get("blocked_syscalls") or []), (
+        "clone must stay callable; it is denied conditionally, not outright"
+    )
+    guards = seccomp.get("argument_guards") or {}
+    assert "clone" in guards, f"the clone argument guard is missing: {seccomp}"
+    assert guards["clone"]["low_mask"] == "0x7e020080", guards
+
+
+def test_ordinary_threads_and_subprocesses_still_work(
+    enforcer_factory, containment_workspace
+):
+    """The clone rule must not break the runtimes agents actually use.
+
+    A security rule that stops namespace creation by breaking threads or
+    ``subprocess`` would be worse than the gap it closes. This runs a workload
+    that exercises both inside the real sandbox and demands that it finishes
+    cleanly.
+    """
+    enforcer, profile = enforcer_factory()
+    result = Path(containment_workspace) / "ordinary.json"
+    if result.exists():
+        result.unlink()
+
+    workload = Path(containment_workspace) / "ordinary_workload.py"
+    workload.write_text(
+        "import json, pathlib, subprocess, sys, threading\n"
+        "out = pathlib.Path(sys.argv[1])\n"
+        "seen = []\n"
+        "def worker(n):\n"
+        "    seen.append(n)\n"
+        "threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]\n"
+        "for t in threads: t.start()\n"
+        "for t in threads: t.join()\n"
+        "proc = subprocess.run([sys.executable, '-c', 'print(6*7)'],\n"
+        "                      capture_output=True, text=True, check=True)\n"
+        "forked = subprocess.Popen([sys.executable, '-c', 'print(1)'],\n"
+        "                          stdout=subprocess.PIPE)\n"
+        "forked.communicate()\n"
+        "out.write_text(json.dumps({\n"
+        "    'threads_started': len(threads),\n"
+        "    'threads_ran': sorted(seen),\n"
+        "    'subprocess_stdout': proc.stdout.strip(),\n"
+        "    'subprocess_rc': proc.returncode,\n"
+        "    'popen_rc': forked.returncode,\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+
+    from the_watcher.enforcement import SandboxSpec
+
+    spec = SandboxSpec(
+        command=(sys.executable, str(workload), str(result)),
+        profile=profile,
+        workspace_host=str(containment_workspace),
+        cwd_inner=str(containment_workspace),
+        unit_key="ordinary-workload",
+    )
+    enforcer.prepare(profile, spec)
+    unit = enforcer.launch(spec)
+    enforcer_factory.units.append((enforcer, unit))
+
+    assert wait_for(result.exists, timeout=60), (
+        "the workload did not finish; guard problems "
+        f"{(unit.metadata.get('guard_report') or {}).get('problems')}, log tail: "
+        + str((unit.metadata.get("guard_report") or {}).get("guard_log_tail"))
+    )
+    payload = _read_json_when_complete(result)
+
+    assert payload["threads_started"] == 8
+    assert payload["threads_ran"] == list(range(8)), payload
+    assert payload["subprocess_stdout"] == "42"
+    assert payload["subprocess_rc"] == 0
+    assert payload["popen_rc"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 34d. The hard case: nested namespaces + ancestor exit + reparent
+# ---------------------------------------------------------------------------
+
+
+def test_a_nested_namespace_survivor_cannot_evade_verify_empty(
+    enforcer_factory, containment_workspace
+):
+    """The adversarial lifecycle, end to end.
+
+    ``sandbox init -> descendant -> descendant creates nested user/PID
+    namespaces with legacy clone -> the ancestor exits -> the nested child is
+    reparented and stays alive -> verify_empty() runs``.
+
+    The nested child carries **different** ``user``, ``pid`` and ``mnt``
+    inode values from the unit, so a check based on namespace inode equality
+    cannot see it. The point of this test is that the layered scan still does.
+    """
+    enforcer, profile = enforcer_factory()
+    marker = Path(containment_workspace) / "hard-case.json"
+    unit, marker = _run_probe_in_sandbox(
+        enforcer,
+        profile,
+        containment_workspace,
+        ("--hard-case", str(marker), "--hold", "25"),
+        "hard-case.json",
+    )
+    enforcer_factory.units.append((enforcer, unit))
+
+    assert wait_for(marker.exists, timeout=60), (
+        "the adversarial workload reported nothing; guard problems: "
+        + str((unit.metadata.get("guard_report") or {}).get("problems"))
+    )
+    payload = _read_json_when_complete(marker)
+    nested = payload["nested"]
+
+    if not nested.get("ok"):
+        # This is now the expected outcome, and it is a PASS rather than a
+        # skip: the seccomp argument guard denied the primitive before any
+        # escape existed. Reported explicitly so the log says which enforcement
+        # held, and so a future regression to "succeeded" is visible here.
+        assert nested.get("clone_errno_name") == "EPERM", (
+            "the escape was refused, but not by the seccomp filter: "
+            f"{nested}"
+        )
+        assert payload.get("nested_alive_after_ancestor_exit") is not True, (
+            "the primitive was refused yet a nested child was left behind: "
+            f"{payload}"
+        )
+        # The detection logic itself is still covered, synthetically and on
+        # every platform, by tests/test_containment_identity.py. Say so here so
+        # nobody reads this early return as "the scan was never tested".
+        return
+
+    # Defence in depth: if a future kernel or profile ever lets the primitive
+    # through again, the survivor scan must still find the result. Everything
+    # below is what makes that claim testable rather than assumed.
+    assert payload["ancestor_exited"] is True
+    sandbox_ns = payload["sandbox_namespaces"]
+    child_ns = nested["child_namespaces"]
+    assert child_ns["user"] != sandbox_ns["user"], "the child kept the unit's user namespace"
+    assert child_ns["pid"] != sandbox_ns["pid"], "the child kept the unit's PID namespace"
+    assert child_ns["mnt"] != sandbox_ns["mnt"], "the child kept the unit's mount namespace"
+    # ...and the nested child outlived the ancestor that created it.
+    assert payload["nested_state_after_ancestor_exit"] != "Z", (
+        "the nested child was not alive after its ancestor exited, so the hard "
+        f"case was not exercised: {payload}"
+    )
+    assert payload["nested_reparented_to"] == 1, (
+        "the nested child was not reparented to the sandbox init"
+    )
+
+    from the_watcher.enforcement.procfs import snapshot
+
+    child_pid_ns = child_ns["pid"]
+    host_pids = [
+        record.pid
+        for record in snapshot()
+        if record.pid_ns == child_pid_ns and record.live
+    ]
+    assert host_pids, "the nested child is not visible to the host at all"
+
+    # The survivor is found - and only the layered scan can do it, because
+    # neither inode comparison matches.
+    scan = enforcer.scan_survivors(unit)
+    assert scan.empty is False, (
+        "verify_empty reported the unit as empty while a nested-namespace "
+        f"descendant was alive: {scan.to_dict()}"
+    )
+    assert any(pid in scan.survivors for pid in host_pids), (
+        "the nested descendant was alive but invisible to the survivor scan: "
+        f"child={host_pids} survivors={scan.survivors} layers={scan.layers}"
+    )
+    assert scan.layers["ancestry"]["pids"], (
+        "nothing was found by ancestry, so the detection rested on an "
+        f"assumption that the escape defeats: {scan.layers}"
+    )
+
+    # And after termination the unit really is empty.
+    enforcer.terminate(unit, grace=1.0)
+    empty, survivors = enforcer.verify_empty(unit)
+    assert empty, f"processes survived termination: {survivors}"
+
+
+# ---------------------------------------------------------------------------
 # 37+: kill switch and daemon integration
 # ---------------------------------------------------------------------------
 
@@ -688,6 +1107,96 @@ def test_daemon_launches_inside_a_containment_unit(enforced_daemon, containment_
     assert daemon.unit is not None
     assert daemon.evidence is not None
     assert daemon.evidence.verified is True, daemon.evidence.problems
+
+
+def test_an_unenforceable_requested_ceiling_stops_the_session_before_launch(
+    enforced_daemon, containment_workspace, tmp_path
+):
+    """An explicitly requested control the backend cannot apply fails closed.
+
+    ``--cpus`` is the concrete case: the rootless namespace backend has no
+    cgroup quota, so a requested CPU ceiling cannot be honoured. The session
+    must be refused with exit 78 (enforcement refused) and the workload must
+    **never have run** - no marker file, and no ``process_started`` event.
+    """
+    import dataclasses
+
+    from the_watcher.enforcement import get_preset
+
+    marker = tmp_path / "workload-ran.txt"
+    profile = dataclasses.replace(
+        get_preset("research-strict"),
+        resources=dataclasses.replace(
+            get_preset("research-strict").resources, cpus=2.0
+        ),
+    )
+    daemon = enforced_daemon(
+        command=[
+            sys.executable,
+            "-c",
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')",
+        ],
+        profile=profile,
+    )
+
+    exit_code = daemon.run()
+
+    assert exit_code == 78, (
+        f"expected the enforcement-refused code, got {exit_code}: {daemon.internal_error}"
+    )
+    assert daemon.enforcement_refused, "the refusal was not reported"
+    assert "resources.cpus" in daemon.enforcement_refused
+    assert not marker.exists(), "the workload ran despite the refused ceiling"
+    assert daemon.unit is None, "a containment unit was launched anyway"
+    # The refusal happens during preparation, before a trace exists at all -
+    # so there is nothing to inspect, which is itself the strongest form of
+    # "the workload never started".
+    if daemon.prepared:
+        types = [event.event_type for event in daemon.trace]
+        assert "process_started" not in types
+        assert "containment_started" not in types
+        assert daemon.trace.verify().valid
+
+
+def test_an_unspecified_ceiling_does_not_stop_the_session(
+    enforced_daemon, containment_workspace
+):
+    """Not asking for a control is not the same as asking for one we lack."""
+    daemon = enforced_daemon()
+    exit_code = daemon.run()
+    assert exit_code == 0, daemon.internal_error
+
+
+def test_reduced_protection_opt_in_is_recorded_and_allows_the_session(
+    enforced_daemon, containment_workspace
+):
+    """The explicit waiver is the only way to run without a requested ceiling."""
+    import dataclasses
+
+    from the_watcher.enforcement import get_preset
+
+    base = get_preset("research-strict")
+    profile = dataclasses.replace(
+        base,
+        resources=dataclasses.replace(base.resources, cpus=2.0),
+        allow_reduced_protection=True,
+    )
+    daemon = enforced_daemon(profile=profile)
+    exit_code = daemon.run()
+    assert exit_code == 0, daemon.internal_error
+
+    prepared = [
+        event for event in daemon.trace if event.event_type == "containment_prepared"
+    ]
+    assert prepared, "no containment_prepared event"
+    metadata = prepared[0].metadata
+    assert metadata["allow_reduced_protection"] is True
+    assert metadata["reduced_protection"] is True
+    assert any(
+        entry["field"] == "resources.cpus"
+        for entry in metadata["declared_but_unhonoured"]
+    )
+    assert daemon.trace.verify().valid
 
 
 def test_daemon_records_the_containment_lifecycle(enforced_daemon):

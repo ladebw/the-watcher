@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 __all__ = ["Decision", "Risk", "Evaluation", "max_decision", "blocked"]
 
@@ -81,6 +81,11 @@ class Evaluation:
     reason: str = "no policy rule matched"
     rule: str = "default"
     tripwire_id: "str | None" = None
+    #: Which facts the verdict was built from, and how much each was worth
+    #: (``AUTHORITATIVE`` / ``OBSERVED`` / ``CLIENT_ASSERTED``). Recorded in the
+    #: trace so a reader can see whether a decision rested on host state or on
+    #: the workload's own account of itself.
+    facts: "Mapping[str, str]" = field(default_factory=dict)
 
     @property
     def allowed(self) -> bool:
@@ -98,6 +103,7 @@ class Evaluation:
             reason=f"{self.reason}; {reason}" if self.reason else reason,
             rule=rule,
             tripwire_id=self.tripwire_id,
+            facts=dict(self.facts),
         )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -107,6 +113,8 @@ class Evaluation:
         }
         if self.tripwire_id:
             payload["tripwire_id"] = self.tripwire_id
+        if self.facts:
+            payload["fact_authority"] = dict(self.facts)
         return payload
 
     def __str__(self) -> str:
