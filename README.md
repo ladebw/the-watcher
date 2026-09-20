@@ -272,9 +272,9 @@ thing watching it, so the boundary was only as good as the agent's cooperation.
 
 **V2 — external supervisor.** Policy, the trace, tripwires and the kill switch
 moved into a separate supervisor process, reached over an authenticated IPC
-socket. The agent could be stopped even if it never called a client library; its
-boundaries are still cooperative, because evaluation depends on actions being
-presented.
+socket. The agent could be stopped even if it never called a client library.
+V2 does not provide containment: its boundaries are cooperative, because
+evaluation depends on the action being presented rather than on the kernel.
 
 **V3 — OS containment.** On Linux, declared protections became kernel-enforced:
 namespaces, seccomp, Landlock path rules, capability drop, resource limits. A
