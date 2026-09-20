@@ -31,6 +31,7 @@ import threading
 from typing import Any, Sequence
 
 from . import __version__
+from .exceptions import PolicyError
 from .poe import TraceVerifier
 from .watcher import Policy, PoEWatcher
 
@@ -98,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run a command under the Watcher",
         description="Run a command under the Watcher: policy, tripwires, PoE trace.",
     )
-    run.add_argument("--policy", metavar="FILE", help="policy JSON file")
+    run.add_argument("--policy", metavar="FILE", help="policy file: a Policy V1 JSON document, or an existing V3 policy")
     run.add_argument(
         "--trace-out",
         metavar="FILE",
@@ -411,14 +412,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_policy(args: argparse.Namespace) -> Policy:
-    if args.policy:
-        policy = Policy.load(args.policy)
-        policy.workspace_root = args.workspace
-    else:
-        policy = Policy(workspace_root=args.workspace)
+class _PolicySource:
+    """The policy in force, plus what a Policy V1 document brings alongside it."""
 
-    # Explicit CLI flags always win over the policy file.
+    def __init__(
+        self,
+        policy: Policy,
+        tripwires=None,
+        projection=None,
+        session_timeout=None,
+    ) -> None:
+        self.policy = policy
+        self.tripwires = tripwires
+        self.projection = projection
+        self.session_timeout = session_timeout
+
+
+#: Flags that configure the *V3* policy document. A Policy V1 document defines
+#: these itself, so the combination is refused rather than silently resolved in
+#: one direction or the other.
+_V3_SHAPING_FLAGS = (
+    ("allow_path", "--allow-path"),
+    ("forbid_path", "--forbid-path"),
+    ("allow_domain", "--allow-domain"),
+    ("forbid_domain", "--forbid-domain"),
+    ("max_processes", "--max-processes"),
+)
+
+
+def _apply_v3_overrides(args: argparse.Namespace, policy: Policy) -> None:
+    """Explicit CLI flags always win over the V3 policy file."""
     if args.allow_path:
         policy.allowed_paths = tuple(args.allow_path)
     if args.forbid_path:
@@ -431,7 +454,84 @@ def _build_policy(args: argparse.Namespace) -> Policy:
         )
     if args.max_processes is not None:
         policy.max_processes = args.max_processes
-    return policy
+
+
+def _looks_like_policy_v1(text: str) -> bool:
+    """Is this document Policy V1, rather than an existing V3 policy file?
+
+    Policy V1 *requires* a top-level ``version`` field, and the V3 policy schema
+    has no such field - its loader rejects unknown keys - so the two formats
+    cannot be confused in either direction. A document with ``version`` is V1;
+    anything else keeps the V3 path it has today.
+
+    This parse is a discriminator, not a validation: the chosen loader re-parses
+    the same text strictly, so duplicate keys, non-finite numbers and every other
+    refusal still come from the strict loader. A file that is not JSON at all
+    falls through to the V3 loader, which reports the syntax error exactly as it
+    does now.
+    """
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(document, dict) and "version" in document
+
+
+def _load_policy_source(args: argparse.Namespace) -> _PolicySource:
+    """Load the policy in force, before any protected process is launched.
+
+    Every failure here is a failure to launch: the caller reports it and exits
+    non-zero without starting a child.
+    """
+    path = getattr(args, "policy", None)
+    if not path:
+        policy = Policy(workspace_root=args.workspace)
+        _apply_v3_overrides(args, policy)
+        return _PolicySource(policy=policy, session_timeout=args.timeout)
+
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read().decode("utf-8")
+    except OSError as exc:
+        raise PolicyError(f"cannot read policy file {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise PolicyError(f"policy file {path} is not valid UTF-8: {exc}") from exc
+
+    if not _looks_like_policy_v1(text):
+        policy = Policy.from_json(text)
+        policy.workspace_root = args.workspace
+        _apply_v3_overrides(args, policy)
+        return _PolicySource(policy=policy, session_timeout=args.timeout)
+
+    from .policy_v1 import loads_policy
+    from .policy_v1_runtime import project_policy_v1
+
+    conflicting = [flag for attribute, flag in _V3_SHAPING_FLAGS if getattr(args, attribute, None)]
+    if conflicting:
+        raise PolicyError(
+            "a Policy V1 document defines its own filesystem, network and process "
+            "rules, so " + ", ".join(conflicting) + " cannot be combined with it; "
+            "express the restriction in the document instead"
+        )
+
+    document = loads_policy(text, source=path)
+    projection = project_policy_v1(document, workspace_root=args.workspace)
+
+    # ``process.max_runtime_seconds`` becomes a real supervisor ceiling: the
+    # session timeout is enforced by the kill switch. An explicit ``--timeout``
+    # still applies, and the stricter of the two wins.
+    document_timeout = float(document.process.max_runtime_seconds)
+    session_timeout = (
+        document_timeout
+        if args.timeout is None
+        else min(float(args.timeout), document_timeout)
+    )
+    return _PolicySource(
+        policy=projection.policy,
+        tripwires=projection.tripwires,
+        projection=projection,
+        session_timeout=session_timeout,
+    )
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -453,22 +553,31 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    policy = _build_policy(args)
+    # The policy is loaded and validated *before* anything is launched, so an
+    # unenforceable document cannot leave a half-protected child running.
+    try:
+        source = _load_policy_source(args)
+    except PolicyError as exc:
+        print(f"watcher run: {exc}", file=sys.stderr)
+        return 2
+
     if args.inline:
-        return _cmd_run_inline(args, command, policy)
-    return _cmd_run_v2(args, command, policy)
+        return _cmd_run_inline(args, command, source)
+    return _cmd_run_v2(args, command, source)
 
 
 def _cmd_run_inline(
-    args: argparse.Namespace, command: Sequence[str], policy: Policy
+    args: argparse.Namespace, command: Sequence[str], source: _PolicySource
 ) -> int:
     """V1 behaviour: the Watcher lives inside this process."""
-    watcher = PoEWatcher(policy=policy, workspace_root=args.workspace)
+    watcher = PoEWatcher(
+        policy=source.policy, workspace_root=args.workspace, tripwires=source.tripwires
+    )
     session = watcher.protect(list(command), cwd=args.workspace)
 
     with session:
         try:
-            exit_code = int(session.wait(timeout=args.timeout))
+            exit_code = int(session.wait(timeout=source.session_timeout))
         except subprocess.TimeoutExpired:
             watcher.kill(reason="MAX_RUNTIME_EXCEEDED", process=session.process)
             exit_code = TIMEOUT_EXIT_CODE
@@ -505,7 +614,7 @@ def _build_child_env(values: "Sequence[str]") -> dict[str, str]:
 
 
 def _cmd_run_v2(
-    args: argparse.Namespace, command: Sequence[str], policy: Policy
+    args: argparse.Namespace, command: Sequence[str], source: _PolicySource
 ) -> int:
     """V2/V3: an external supervisor owns policy, PoE, tripwires and the kill switch."""
     from .enforcement import EnforcementMode
@@ -516,7 +625,8 @@ def _cmd_run_v2(
 
     config = DaemonConfig(
         command=list(command),
-        policy=policy,
+        policy=source.policy,
+        tripwires=source.tripwires,
         workspace_root=args.workspace,
         cwd=args.workspace,
         storage_root=args.storage_root,
@@ -528,7 +638,7 @@ def _cmd_run_v2(
         heartbeat_timeout=args.heartbeat_timeout,
         heartbeat_action=args.heartbeat_action,
         ipc_lost_action=args.ipc_lost_action,
-        session_timeout=args.timeout,
+        session_timeout=source.session_timeout,
         stdout=None if args.quiet else sys.stderr,
         enforcement=EnforcementMode.ENFORCED if enforced else EnforcementMode.OFF,
         containment=containment,
@@ -567,6 +677,15 @@ def _cmd_run_v2(
         }
         if daemon.enforcement_refused:
             summary["enforcement_refused"] = daemon.enforcement_refused
+        if source.projection is not None:
+            projected = source.projection.to_dict()
+            summary["policy"] = {
+                "format": projected["policy_format"],
+                "document_digest": projected["policy_document_digest"],
+                "enforced": projected["enforced_here"],
+                "not_applicable": projected["not_applicable"],
+                "refused": projected["refused_here"],
+            }
         print(json.dumps(summary, indent=2))
 
         if daemon.enforcement_refused:

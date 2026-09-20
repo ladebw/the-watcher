@@ -2,11 +2,14 @@
 
 The Watcher's public policy document format.
 
-> **Status: Phase 1 — schema, normalisation and digest.**
-> This format is implemented, validated and digested. **Nothing in it is
-> enforced at runtime yet**, and it is deliberately **not** wired into
-> `watcher run`. Do not deploy it as a control; see
-> [What is not enforced yet](#what-is-not-enforced-yet).
+> **Status: Phase 2 — minimal policy runtime wiring.**
+> This format is implemented, validated, digested, and wired into
+> `watcher run --policy` through a single projection boundary. That projection
+> **enforces** some fields, **refuses** others rather than applying them
+> silently, and treats the rest as not applicable. What falls where is stated
+> precisely in [§12](#12-runtime-wiring-phase-2) and in
+> [What is not enforced yet](#what-is-not-enforced-yet). Decisions are made
+> through the cooperative action API, **not** by OS-level interception.
 
 ---
 
@@ -389,30 +392,35 @@ piped. Exit code `0` on success, `2` on any validation or parse failure.
 
 ## 10. What is not enforced yet
 
-**No Policy V1 field is enforced at runtime, and the format is not wired into
-`watcher run`.** `watcher run --policy` still loads the existing V3 policy JSON;
-feeding it a Policy V1 document fails loudly.
+As of Phase 2 the format is wired into `watcher run --policy` (§12), but not
+every field is enforceable there. A field the runtime cannot faithfully apply is
+**refused** rather than silently ignored, so no control is absent without a loud
+error; the remaining fields stay document configuration. A V3 policy file is
+unaffected and still loads through the V3 loader.
 
-| Section | Phase 1 status | Planned |
+| Section | Status with `watcher run --policy` | Not enforced yet |
 |---|---|---|
-| `filesystem` | document only | Landlock allow-list + evaluator, Phase 2+ |
-| `network` | document only | refused at runtime today; broker in Phase 8 |
-| `process` | document only | `RLIMIT_NPROC` / `pid_max` projection, Phase 2+ |
-| `resources` | document only | rlimits now, cgroups in Phase 7 |
-| `tripwires` | document only | tripwire registry projection, Phase 2 |
-| `on_violation` | document only | decision mapping, Phase 2 |
+| `filesystem` | **enforced** for a Policy V1 document: `allow`/`deny` are evaluated with Policy V1 pattern semantics, deny before allow. Refused on Windows, where an absolute POSIX pattern cannot match a `C:/...` subject | OS-level interception; containment remains the enforcement backends' job |
+| `network` | `mode: "none"` (the default) is enforced as **no network access**: the projection sets `restrict_network = True` with an empty allow-list, so the cooperative domain check denies every target. `restricted`/`open` and non-empty allow/deny lists are refused | the broker, Phase 8 |
+| `process` | **enforced** for a Policy V1 document: `max_runtime_seconds` becomes the supervisor session timeout the kill switch enforces, and `max_children` is projected onto the runtime process-tree ceiling | `RLIMIT_NPROC` / `pid_max` projection, Phase 2+ |
+| `resources` | document only; the Phase 2 projection **refuses** a configured ceiling | rlimits now, cgroups in Phase 7; ceilings remain a containment-profile concern |
+| `tripwires` | **enforced** for a Policy V1 document when the pattern is a literal path; a wildcard pattern is refused because the registry matches literal paths only | nothing further planned in this phase |
+| `on_violation` | **enforced** for `filesystem` and `tripwire`; document only for `network`, `process` and `resources`, whose decisions the projection refuses when changed from their documented defaults | decision mapping for those subsystems waits on the subsystems themselves |
 
-`the_watcher.policy_v1.ENFORCED_IN_PHASE_1` carries this table in code, and a
-test asserts it still says "no runtime enforcement", so the documentation cannot
-drift ahead of the implementation.
+`the_watcher.policy_v1.ENFORCED_IN_PHASE_1` carries the Phase 1 per-section
+status in code and a test still asserts it says "no runtime enforcement"; that
+constant describes Phase 1 and is deliberately unchanged. What the runtime
+enforces now comes from the projection in `the_watcher/policy_v1_runtime.py`,
+and an unenforceable document is refused there rather than ignored here.
 
 `the_watcher.enforcement.declared` remains the authority on what a containment
 backend actually enforces for a given profile.
 
 ## 11. Layering (future)
 
-Phase 2 will add `Watcher baseline → Organization → Project → Session` with a
-deterministic merge that can only ever *add* restriction:
+Phase 2 wires the document to the runtime (§12) and **does not** add layering.
+A later phase will add `Watcher baseline → Organization → Project → Session` with
+a deterministic merge that can only ever *add* restriction:
 
 ```
 DENY > ALLOW
@@ -426,3 +434,153 @@ mandatory rules cannot be disabled
 The result of that merge is what `watcher-policy-resolved/1` will digest. See
 `docs/V4_DESIGN.md` §5 for the merge lattice. Phase 1 defines only the *document*
 — one layer, as authored.
+
+## 12. Runtime wiring (Phase 2)
+
+Phase 2 connects the Phase 1 document to the running supervisor through exactly
+one new module, `the_watcher/policy_v1_runtime.py`. That module is the only
+boundary between the document format and the runtime: `the_watcher/policy_v1.py`
+stays a pure document model with no runtime authority, and the V3/V2 runtime
+keeps owning decisions, tripwires, the kill switch and the trace.
+
+```console
+$ watcher run --policy watcher.json -- python agent.py
+```
+
+### 12.1 Format detection
+
+`watcher run --policy FILE` decides from the document itself which loader to use:
+
+- a document with a top-level `"version"` key is **Policy V1**;
+- anything else keeps the **existing V3** path it has today.
+
+The two cannot be confused in either direction. Policy V1 *requires* `version`,
+and the V3 schema has no `version` field and rejects unknown keys
+(`Policy.from_dict`), so a document written for one format cannot load as the
+other. The detection parse is only a discriminator, not a validation: the chosen
+loader re-parses the same text strictly, so duplicate keys, non-finite numbers
+and every other refusal still come from the strict loader. A file that is not
+JSON at all falls through to the V3 loader, which reports the syntax error
+exactly as it does now.
+
+### 12.2 The projection is deterministic
+
+The projection is a deterministic function of the **canonical** document. There
+is no clock, no environment lookup and no filesystem access in it. Because the
+canonical form is what the digest is taken over, two documents with the same
+digest produce the same runtime configuration.
+
+The classification is derived from field *values*, never from whether a key was
+written. Policy V1 materialises defaults, so `{"network": {"mode": "none"}}` and
+omitting `network` normalise to the same bytes and therefore receive the same
+treatment.
+
+### 12.3 Per-field classification
+
+Every Policy V1 field is classified, and the classification is enforced rather
+than documented and hoped for. `ENFORCED` means the runtime does the thing the
+document says. `NOT APPLICABLE` means the field holds its documented default, so
+the author configured nothing and there is nothing to enforce. `REFUSED` means
+the document asks for something this runtime cannot faithfully do — and a
+refusal is an error, never a silent no-op.
+
+| Field | Classification | Runtime effect |
+|---|---|---|
+| `version` | ENFORCED | the version is validated as part of loading |
+| `name` | ENFORCED (recorded) | recorded as the runtime policy name |
+| `filesystem.allow` | ENFORCED when non-empty; NOT APPLICABLE when empty | Policy V1 pattern semantics at runtime |
+| `filesystem.deny` | ENFORCED when non-empty; NOT APPLICABLE when empty | Policy V1 pattern semantics, evaluated before allow |
+| `on_violation.filesystem` | ENFORCED | DENY / QUARANTINE / KILL all map to existing runtime decisions |
+| `on_violation.tripwire` | ENFORCED | Policy V1 permits only KILL, which the existing kill switch applies |
+| `process.max_runtime_seconds` | ENFORCED | applied as the supervisor session timeout enforced by the kill switch |
+| `process.max_children` | ENFORCED when set; NOT APPLICABLE at the default 32 | projected onto the runtime process-tree ceiling; conservative, because total <= N implies children <= N |
+| `network.mode` = `"none"` (the default) | ENFORCED | **`none` means no network access**, not "no network policy": it is projected as `restrict_network = True` with an empty allow-list, so the existing domain check denies every target. The kernel-enforced half of that mapping — the empty network namespace — is the containment posture and needs `--enforced` on Linux; without it the denial is cooperative, not OS interception |
+| `network.mode` = `"restricted"` or `"open"` | REFUSED | there is no network interception in this runtime; the broker is Phase 8 |
+| `network.allow`, `network.deny` | REFUSED when non-empty | a broker is required to honour a hostname allow/deny list; the broker is Phase 8 |
+| `resources.memory_mb`, `resources.cpu_seconds` | REFUSED when set | resource ceilings are a containment-profile concern, not a policy-document one |
+| `on_violation.network`, `on_violation.process`, `on_violation.resources` | REFUSED when changed from their documented defaults | no rule of that subsystem is enforceable here, so the decision could never be applied faithfully |
+| `tripwires` | ENFORCED for literal paths; REFUSED for a pattern using `*`, `**` or `?` | the tripwire registry matches literal paths only, so a wildcard would be registered as a literal that never fires |
+| anything else at its documented default (or absent) | NOT APPLICABLE | the author configured nothing |
+
+`filesystem` and `tripwires` are ENFORCED only where an absolute POSIX pattern
+can match the action path. On Windows the projection refuses both rather than
+accepting a rule that cannot fire (§12.8).
+
+**One runtime guard is not configurable from the document.** `process.max_children`
+is projected onto the runtime process-tree ceiling, and the runtime additionally
+KILLs when the tree exceeds that ceiling by its own multiplier (3). Policy V1 has
+no field for that guard, so a document declaring
+`on_violation.process = "DENY"` can still reach KILL. It only ever escalates
+relative to the document — never weaker — but it is a decision the document did
+not author, and the degenerate case is worth knowing: with
+`process.max_children = 0` the guard's hard limit is `0 × 3`, so **any** child
+process reaches KILL rather than DENY.
+
+### 12.4 Fail closed
+
+Any REFUSED field makes `watcher run` fail. The document is loaded, validated
+and projected **before** the protected process is launched, so a refusal exits
+`2` with a located error and **no child is started**. A document that asks for a
+control this runtime cannot apply never runs half-protected, and a control is
+never silently missing.
+
+### 12.5 Precedence and one canonical subject
+
+- **DENY is evaluated before ALLOW**, always. A path that matches a deny rule is
+  denied even when it also matches an allow rule.
+- **A configured allow-list is a default-deny** for paths outside it. This is
+  the one behaviour Policy V1 inherits unchanged from V3.
+- **When no allow-list is configured, an absent allow-list restricts nothing.**
+  That is the documented V3 behaviour, preserved rather than reinterpreted.
+- **One canonical subject per action.** The action path is canonicalised once
+  using the runtime's existing canonicalisation (relative paths resolve against
+  `--workspace`) and the result is reused for every rule. DENY and ALLOW are then
+  evaluated against that single string, so two rules cannot disagree about which
+  path they decided on.
+
+### 12.6 Interaction with CLI flags
+
+`--allow-path`, `--forbid-path`, `--allow-domain`, `--forbid-domain` and
+`--max-processes` configure the **V3** policy document. A Policy V1 document
+defines those rules itself, so combining these flags with a Policy V1 document
+is refused rather than silently resolved in one direction or the other. An
+explicit `--timeout` is still accepted: the stricter of it and
+`process.max_runtime_seconds` wins.
+
+### 12.7 Proof of Execution
+
+Every Policy V1 decision records, inside the existing event metadata (the frozen
+top-level event schema is unchanged), a `policy_evidence` object:
+
+| Key | Value |
+|---|---|
+| `policy_format` | `watcher-policy/1` |
+| `policy_document_digest` | the supervisor-computed digest from Phase 1 |
+| `policy_subsystem` | the subsystem that produced the decision |
+| `policy_rule` | the rule that fired, e.g. `policy_v1:filesystem.deny[2]` |
+| `canonical_subject` | the one canonical action path the rule was evaluated against |
+
+The digest is computed by the supervisor, and the evidence is merged into the
+metadata last, so a workload-supplied value of the same name cannot displace it.
+
+### 12.8 Platform limitation (Windows)
+
+Policy V1 patterns are absolute POSIX paths, and the format refuses drive
+letters on purpose, so that one document means one thing everywhere. A Windows
+action path canonicalises to `C:/...`, which no absolute POSIX pattern can ever
+equal. On Windows a non-empty filesystem rule or tripwire pattern would
+therefore match nothing while looking exactly like a working rule, so the
+projection **refuses** such a document with a precise message instead of
+accepting it. On Windows, only documents with no filesystem rules and no
+tripwire patterns project successfully.
+
+### 12.9 What this is, and is not
+
+Decisions are produced through the existing `PoEWatcher.evaluate` cooperative
+action API. This is **not OS-level interception**: the runtime decides when the
+workload asks it to decide, and containing a workload that does not ask remains
+the job of the enforcement backends (`the_watcher.enforcement.declared` remains
+their authority on what a backend actually enforces).
+
+The old V3 policy format is unchanged. A V3 policy file still loads through the
+V3 loader, and `watcher run` without `--policy` behaves exactly as before.

@@ -86,6 +86,12 @@ class Evaluation:
     #: trace so a reader can see whether a decision rested on host state or on
     #: the workload's own account of itself.
     facts: "Mapping[str, str]" = field(default_factory=dict)
+    #: Structured evidence about *why* this verdict exists, recorded in the trace
+    #: under ``policy_evidence``. Used by the Policy V1 runtime projection to
+    #: record the supervisor-computed document digest, the subsystem and rule
+    #: that fired, and the canonical subject the rule was evaluated against. It is
+    #: built by the supervisor and is never taken from the workload.
+    evidence: "Mapping[str, Any]" = field(default_factory=dict)
 
     @property
     def allowed(self) -> bool:
@@ -104,6 +110,7 @@ class Evaluation:
             rule=rule,
             tripwire_id=self.tripwire_id,
             facts=dict(self.facts),
+            evidence=dict(self.evidence),
         )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -115,6 +122,8 @@ class Evaluation:
             payload["tripwire_id"] = self.tripwire_id
         if self.facts:
             payload["fact_authority"] = dict(self.facts)
+        if self.evidence:
+            payload["policy_evidence"] = dict(self.evidence)
         return payload
 
     def __str__(self) -> str:

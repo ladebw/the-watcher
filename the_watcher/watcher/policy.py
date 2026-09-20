@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from dataclasses import replace
 
@@ -155,6 +155,24 @@ class Policy:
     allow_privilege_escalation: bool = False
     allow_host_resource_access: bool = False
     allow_persistence: bool = False
+
+    #: Policy V1 runtime projection hook. When set, filesystem decisions are
+    #: taken by this callable - which applies Policy V1 pattern semantics
+    #: (``*``, ``**``, ``?``) - instead of ``allowed_paths``/``forbidden_paths``.
+    #: It is a *rule provider* for the existing evaluation flow, never a second
+    #: engine: the callable returns the runtime's own ``Evaluation`` and the
+    #: surrounding candidate/authority handling is unchanged. ``None`` for every
+    #: document that is not a projected Policy V1 policy.
+    path_rule: "Callable[[Any], Evaluation | None] | None" = None
+
+    #: Supervisor-computed evidence about the policy in force (format, document
+    #: digest, name). Recorded in the trace by the watcher. Never populated from
+    #: a workload-supplied value.
+    policy_evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def evidence(self) -> Mapping[str, Any]:
+        """Evidence about the policy in force, for the trace."""
+        return dict(self.policy_evidence)
 
     def __post_init__(self) -> None:
         self.allowed_paths = tuple(self.allowed_paths or ())
@@ -375,6 +393,13 @@ class Policy:
         )
 
     def _path_verdict(self, raw_path: Any) -> "Evaluation | None":
+        if self.path_rule is not None:
+            # A projected Policy V1 document owns filesystem semantics: its
+            # patterns understand ``*``/``**``/``?``, which the literal-component
+            # matcher below deliberately does not. Sending them through
+            # ``any_path_matches`` would silently change what they mean.
+            return self.path_rule(raw_path)
+
         path = normalise_path(raw_path, base=self.workspace_root)
         if not path:
             return None

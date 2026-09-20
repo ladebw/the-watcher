@@ -2623,6 +2623,83 @@ in the refusal table, and an explicit statement that Unicode normalisation is
 a normalising editor will not match a differently-encoded path. That behaviour
 was previously undocumented, which made it a trap rather than a decision.
 
+### 20.9 Phase 2 record — minimal policy runtime wiring
+
+Delivered: `the_watcher/policy_v1_runtime.py`, `--policy` format detection in
+`the_watcher/cli.py`, the `Policy.path_rule` and `Policy.policy_evidence` hooks
+in `the_watcher/watcher/policy.py`, and `Evaluation.evidence` in
+`the_watcher/watcher/decision.py`.
+
+**What was wired.** One projection boundary. `policy_v1_runtime.py` reads a
+validated `PolicyV1` document and produces objects the runtime already had — a
+`Policy`, a `TripwireRegistry`, and a per-field disposition record.
+`cli._looks_like_policy_v1` discriminates the two formats on a top-level
+`version` key (the V3 schema has no such field and rejects unknown keys), and
+`cli._load_policy_source` routes a V1 document to `loads_policy` +
+`project_policy_v1` while leaving the V3 path exactly as it was. The runtime
+gained one documented hook — `Policy.path_rule`, consulted by
+`Policy._path_verdict` before the literal-component matcher — and one evidence
+field, `Evaluation.evidence`, merged into event metadata as `policy_evidence`.
+
+**Where authority sits.** Policy V1 still holds no runtime authority: the
+document model parses, validates, normalises and digests, and nothing else. The
+V3/V2 engine was not duplicated and not rewritten. Projected filesystem rules
+are a *rule provider* that returns the runtime's own `Evaluation`, so candidate
+selection, fact authority and the surrounding decision flow are untouched. This
+is the whole of the runtime change: one documented hook for filesystem
+semantics, and one evidence field.
+
+**Classification outcome.** Derived from field *values*, never from whether a
+key was written, because Policy V1 materialises defaults.
+
+| Disposition | Fields |
+|---|---|
+| ENFORCED | `version`, `name` (recorded), `filesystem.allow` / `filesystem.deny`, `on_violation.filesystem`, `on_violation.tripwire`, `process.max_runtime_seconds`, `process.max_children` (when set), literal `tripwires`, and `network.mode` = `"none"` |
+| REFUSED | `network.mode` = `"restricted"` / `"open"` and non-empty `network.allow` / `network.deny` (there is no network interception; the broker is Phase 8), `resources.memory_mb` / `resources.cpu_seconds` (ceilings belong to the containment profile), `on_violation.network` / `on_violation.process` / `on_violation.resources` (no rule of that subsystem is enforceable, so the decision could never be applied faithfully), a tripwire pattern using `*`, `**` or `?` (the registry matches literal paths only), any filesystem rule or tripwire pattern on Windows |
+| NOT APPLICABLE | every field at its documented default, or absent — except `network.mode`, whose default `"none"` is an affirmative no-network posture and is enforced rather than ignored |
+
+A refusal is a `PolicyError` raised before launch: `watcher run` exits `2` with a
+located error and no child is started. A control is never silently missing.
+
+**Filesystem semantics are not the V3 matcher's.** `Policy._path_verdict` sends
+a projected document's paths to `path_rule` and bypasses `any_path_matches`
+deliberately. The V3 matcher compares path *components*, so `**` is a literal
+component there; sending Policy V1 patterns through it would silently change
+their meaning, which is the defect Phase 1 fixed in the format. The proof at
+runtime:
+
+```python
+any_path_matches("/workspace/a/b.txt", ["/workspace/**"])   # False
+```
+
+The same path projected as a Policy V1 rule is allowed, because `**` spans zero
+or more segments under the document's grammar.
+
+**Windows is refused, not accepted as a no-op.** Policy V1 patterns are absolute
+POSIX paths and the format refuses drive letters, while a Windows action path
+canonicalises to `C:/...`. A non-empty filesystem rule or tripwire pattern would
+therefore match nothing while looking like a working rule — the exact failure
+this project refuses everywhere else — so `project_policy_v1` raises instead of
+projecting it. On Windows, only a document with no filesystem rules and no
+tripwire patterns projects successfully.
+
+**Proof of Execution.** Every projected decision records
+`policy_evidence = {policy_format, policy_document_digest, policy_subsystem,
+policy_rule, canonical_subject}` in the existing event metadata; the frozen
+top-level event schema is unchanged. The digest is supervisor-owned and merged
+last, so a workload-supplied value of the same name cannot displace it.
+
+**Deliberately not in this phase:** no layering, no rate limits, no SDK, no
+adapters, no cgroups, no external anchors, no network broker, no new decision
+classes, and no new policy fields.
+
+**Supersession.** The present-tense status statements in §20.2 ("Phase 1 is not
+wired in") and §20.6 ("nothing in Policy V1 is runtime-enforced") describe the
+Phase 1 tree and are left standing as that record. For a Policy V1 document used
+with `watcher run --policy`, this section supersedes them.
+
+**V4 PHASE 2 MINIMAL RUNTIME WIRING READY FOR REVIEW — NOT COMMITTED, NOT PUSHED.**
+
 ---
 
 **V4 DESIGN READY FOR REVIEW — NO IMPLEMENTATION, NO COMMIT, NO PUSH.**
