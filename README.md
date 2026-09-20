@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/the-watcher-logo.png" width="220" alt="The Watcher logo">
+  <img src="public/logo.svg" width="220" alt="The Watcher logo">
 </p>
 
 <h1 align="center">The Watcher</h1>
