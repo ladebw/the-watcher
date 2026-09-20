@@ -628,13 +628,22 @@ special-case `*` either.
 
 Policy V1 therefore defines glob semantics explicitly, and `**` becomes real:
 
-| Pattern form | Meaning | V3 behaviour |
+| Pattern form | Meaning in Policy V1 | V3 engine behaviour today |
 |---|---|---|
 | `/etc` | exactly `/etc` **or any descendant** | same (implicit subtree, `matching.py:57-65`) |
-| `/etc/**` | exactly `/etc` or any descendant | **currently matches nothing** → V4 fixes to subtree |
-| `/etc/*` | `/etc` plus exactly one further segment | currently literal (`*` as a filename char) |
-| `/etc/?asswd` | single character in a segment | currently literal |
+| `/etc/**` | exactly `/etc` or any descendant | **matches nothing** (V3 reads `**` as a literal segment) |
+| `/etc/*` | `/etc` plus exactly one further segment | literal (`*` as a filename char) |
+| `/etc/?asswd` | single character in a segment | literal |
 | `~/.ssh/**` | `~` expanded against the resolution base, then subtree | expansion exists (`matching.py:45`), glob does not |
+
+**These are Policy V1's semantics, and they are not a change to V3's runtime.**
+Policy V1 is a new document format in a new module and is **not runtime-wired**:
+`watcher run --policy` still loads the existing V3 policy JSON and still evaluates
+it with V3's matcher and evaluator. So at runtime today `/etc/**` continues to
+match nothing and `/etc/*` continues to be a literal — exactly what the third
+column says. Nothing in this section alters what V3 enforces. **V3 runtime
+semantics are unchanged**; these semantics take effect only when a later phase
+projects Policy V1 onto the runtime.
 
 Design rules:
 
@@ -642,8 +651,13 @@ Design rules:
    backward compatible and it matches operator intent, and the alternative (exact-only)
    would *weaken* existing policies — a silent relaxation, which the project must never
    do.
-2. **`**` is implemented and is exactly equivalent to the implicit subtree.** Adding it
-   can only *strengthen* relative to today's literal-`*` behaviour.
+2. **`**` is implemented and is exactly equivalent to the implicit subtree.** Resolving it
+   makes the rule behave as written instead of as a literal. The *direction* of that
+   change depends on the rule, so "can only strengthen" would be too strong as a blanket
+   claim: for a `deny` rule the resolved form restricts more, while for an `allow` rule it
+   permits more than today's match-nothing reading. The phase that projects Policy V1 onto
+   the runtime must argue that direction rule by rule. Here it has no runtime effect at
+   all, because the format is not runtime-wired (see the note above).
 3. **Unsupported glob syntax is a validation error at parse time, never a literal.**
    `[abc]`, `{a,b}`, `!(...)`, a `**` in the middle of a segment (`/a/**/b` — supported
    only as a whole trailing segment or a whole middle segment; the *segment* form
@@ -1372,9 +1386,12 @@ clear message until the broker path is complete. Section 15 records that a V4 re
 which does not complete option C still refuses `restricted` — and that this is the
 correct outcome, not a shortfall to paper over.
 
-**Also fixed in Phase 1 regardless of the egress decision:** the `network=open`
-self-refusal described in §8.1, and `is_reduced_protection` staying honest
-(`profile.py:452-453`) for any posture weaker than `none`.
+**Not Phase 1 work.** The `network=open` self-refusal described in §8.1 and
+`is_reduced_protection` honesty (`profile.py:452-453`) for postures weaker than
+`none` are V3-side concerns belonging to the V3 hardening set (§19); Phase 0
+already touched `profile.py` for the declared-versus-enforced work. Phase 1 is
+the Policy V1 document format and touches no V3 runtime file: it **changes no V3
+behaviour**, and it is **not runtime-wired**.
 
 ### 8.4 Required `doctor` reporting
 
@@ -2376,6 +2393,242 @@ than papered over; it is a pre-existing defect worth its own fix.
 
 ---
 
+## 20. Phase 1 record — Policy V1 document format
+
+Delivered: `the_watcher/policy_v1.py`, `watcher policy validate|digest`,
+`docs/policy.md`, `tests/test_policy_v1.py`, `benchmarks/benchmark_policy_v1.py`.
+
+Phase 1 builds the **document boundary** and stops there. It evaluates nothing,
+enforces nothing, and is not wired into `watcher run`.
+
+### 20.1 Decisions taken against the original §4 sketch
+
+Three departures from the design sketch, each to avoid a field meaning two
+things at once — the collision audit the brief asked for:
+
+| Sketch | Phase 1 | Why |
+|---|---|---|
+| `resources.pids` | **rejected**, pointed at `process.max_children` | the containment profile already calls the process ceiling `processes.max_processes`; a third name (`resources.pids`) for one ceiling gives it three meanings. Refused with an error naming the right field. |
+| `network.allow` as CIDRs | **hostnames only**; CIDRs refused | `ContainmentProfile.allowed_networks` already holds CIDRs for the OS backend. The same-looking field in two vocabularies is exactly how a policy ends up meaning the opposite of what its author read. |
+| `on_violation` classes `forbidden_file`, `rate_limit`, `resource_limit`, `process_limit` | `filesystem`, `network`, `process`, `resources`, `tripwire` | the sketch's names mixed rule-level and mechanism-level concepts, and `rate_limit` belongs to Phase 3. Classes that do not exist yet are refused rather than reserved. |
+
+Also settled: `name` defaults to `"default"`, matching the existing V3
+`Policy.name` default, rather than introducing a second default vocabulary.
+
+### 20.2 The `**` defect, and why glob syntax is a security fix
+
+V3's matcher has no glob support at all: `any_path_matches` compares path
+*components* with `path_is_within` (`watcher/matching.py:57-73`), so
+`"/etc/**"` is compared as a literal segment. The result is that the design
+document's own example — `deny: ["/etc/**"]` — **matches nothing**, and a rule
+that matches nothing is indistinguishable from a rule that works.
+
+Phase 1 implements a deliberately tiny grammar (`*` within a segment, `**` as
+whole segments, `?` for one character, literals) and **refuses** everything
+else: `[`, `]`, `{`, `}`, `!`, `\`, and partial-segment `**` such as `a**b`.
+Bare literal paths keep V3's implicit-subtree meaning, so existing semantics are
+preserved rather than reinterpreted; `/a/**` is added as the explicit spelling of
+the same thing, which can only *add* restriction relative to today's
+matches-nothing behaviour.
+
+**No shared code was changed.** `watcher/matching.py` is untouched, so there is
+no path by which Phase 1 can alter V1/V2/V3 behaviour.
+
+**What that means at runtime, concretely.** Because Policy V1 is not wired in,
+`watcher run --policy` still evaluates with V3's matcher, so a rule written
+`/etc/**` still matches nothing today and `/etc/*` is still a literal. Phase 1
+fixes the *format*, not the runtime; the runtime changes only when a later phase
+projects the evaluator onto it. V3 runtime semantics are unchanged.
+
+### 20.3 Decisions that follow from determinism
+
+- **No `~` or `$VAR` expansion.** Expanding either makes one document mean
+  different things on different machines, which breaks the digest's whole
+  purpose. Refused with an explanation.
+- **`..` is refused, not resolved.** Lexical collapsing changes the rule
+  (`/workspace/../etc` becomes `/etc`), and resolving it properly needs the
+  filesystem, which matching must never consult.
+- **Case is never folded.** The same bytes produce the same digest on Windows
+  and Linux, which is what makes cross-platform policy comparison mean anything.
+- **Rule order is not significant**, and the canonical form sorts and
+  de-duplicates rule lists. Policy V1 has no first-match-wins rule: deny and
+  is-restricted win over allow. (V3's engine *is* ordered internally; Phase 2
+  owns proving the projection preserves these semantics.)
+- **Absent section == defaults written out**, so the two share a digest. Fields
+  that are "not configured" by default (`resources.memory_mb`,
+  `resources.cpu_seconds`) are omitted from the canonical form rather than
+  rendered as `null`, so the canonical form never contains a null.
+
+### 20.4 Duplicate keys
+
+`json.loads` silently keeps the *last* of duplicate keys, so
+`{"filesystem": {...}, "filesystem": {...}}` discards a rule set without a word
+— the author and the engine disagree and nothing says so. Phase 1 installs an
+`object_pairs_hook` that rejects a repeated key at every level, plus
+`parse_constant` to refuse `NaN`/`Infinity`/`-Infinity`. A test asserts that the
+plain parser really would have accepted the duplicate, so the premise is
+checked rather than assumed.
+
+### 20.5 Digest
+
+```
+document_digest = SHA256("watcher-policy-document/1" + 0x00 + canonical_json(normalized))
+```
+
+Built on the existing `poe/canonical.py` encoder, so it is the same
+determinism substrate the Proof of Execution uses, with a domain separator so a
+policy digest can never be confused with an event hash.
+`watcher-policy-resolved/1` is **exported as a reserved constant and deliberately
+not produced**: a resolved digest must describe the merged policy, and returning
+the document digest under that name would misstate which policy was in force. A
+test asserts `PolicyV1` has no `resolved_policy_digest` attribute.
+
+### 20.6 Honest status
+
+Nothing in Policy V1 is runtime-enforced, and the format is not wired into
+`watcher run` — feeding a Policy V1 document to `watcher run --policy` fails
+loudly, which the test suite asserts. `the_watcher.policy_v1.ENFORCED_IN_PHASE_1`
+carries the per-section status in code and a test asserts it still says "no
+runtime enforcement", so the documentation cannot drift ahead of the
+implementation. `the_watcher.enforcement.declared` remains the authority on what
+a backend actually enforces.
+
+### 20.7 Measured cost
+
+`benchmarks/benchmark_policy_v1.py`, medians over 60 repeats on Windows /
+Python 3.14.3 and on Linux / Python 3.12.3. The hosts were contended (the max
+column ran 4-100x the median), so these are order-of-magnitude figures. One
+apparent anomaly — `parse_policy` measuring *slower* than `loads_policy`, which
+includes JSON parsing — was resolved by an interleaved A/B measurement
+(274 µs vs 245 µs, ratio 0.89), so it was measurement order, not overhead.
+
+| Measurement | Windows median | Linux median |
+|---|---|---|
+| `loads_policy` (in memory) | ~330-380 µs | ~273 µs |
+| `parse_policy` | ~320-470 µs | ~245 µs (interleaved) |
+| `load_policy` (from file) | ~1.3 ms | ~363 µs |
+| cached `document_digest` | ~0.6 µs | ~0.2 µs |
+| `canonical_encode` | ~145 µs | ~48 µs |
+| one `PathPattern.matches` | ~9-12 µs | ~7 µs |
+| 1000-rule document | ~12-26 ms | ~9 ms |
+
+Startup cost is negligible for a realistic document. The number to carry into
+Phase 2 is the match cost: `matches()` re-validates its subject on every call —
+deliberately, because a matcher must not answer "no match" to a question it
+cannot parse — so Phase 2 should canonicalise the subject **once per action**
+rather than once per rule, or a 50-rule policy costs ~0.5 ms per action.
+
+### 20.8 Adversarial matcher review
+
+The matcher is the one part of Policy V1 that will later run on input the
+*supervised agent* controls — the path it is trying to touch — while the pattern
+comes from the operator. That asymmetry makes the matcher's cost a security
+property, not a performance detail, so it was reviewed adversarially.
+
+**Defect found: quadratic backtracking with an attacker-influenced operand.** The
+original `_segment_matches` used the classic single-backtrack-point algorithm: on
+a mismatch it reset to the last `*` and re-scanned the entire pattern tail. Cost
+therefore grew with pattern × subject, and it was reachable through the public
+API. `"/" + "*" + "?" * 2040` matched against a 4095-character subject — both
+inside the existing caps — cost **1678 ms of CPU for a single match attempt**.
+A supervised agent that picks its own paths could repeat that per rule per
+action; at the 4096-rule cap that is hours of supervisor CPU. Two shapes reached
+this class (`*` followed by a long `?` run, and a long `?` segment after `**`).
+
+**Fix.** The pattern is now split on `*` into `*`-free blocks of fixed length.
+The head block is anchored to the start of the subject, the tail block to its
+end, and interior blocks are located left to right, earliest first — optimal
+because a fixed-length block placed earlier never removes room a later block
+needs. Literal blocks are located with a C-level substring search and `?` blocks
+with a bit-parallel (Shift-And) scan whose per-character work happens in C. The
+guarantee is no longer "the pattern is small", it is "no input shape produces
+superlinear *re-scanning*".
+
+**Result.** The 1678 ms shape now costs **51.7 µs** (≈32,000×), and the same
+input timed against the old algorithm in-process took 1768 ms against 0.173 ms
+for the new one. The worst adversarial shape measured at the caps is now
+**586 µs** — a pattern carrying 1020 stars, where the residual cost is one
+iteration per block, i.e. linear in the pattern length, not in a product.
+
+**Segment level: bounded, not combinatorial, and one wrong claim removed.** The
+`**` matcher had been documented as memoising element comparisons "because
+backtracking revisits the same (pattern, text) pair". That justification is
+false, and it was measured rather than argued: instrumenting the shipped function
+via `inspect.getsource` and recording every `(pattern_position, subject_position)`
+pair found **zero revisits** across all cap-sized adversarial shapes, an
+exhaustive sweep of small inputs, and a 6000-case randomised search at the caps.
+Every walk that follows a backtrack runs along a fresh diagonal, so the loop
+never re-enters a state. The cache could therefore never hit, and was removed: it
+was the only structure whose size grew with pattern × subject, so the matcher's
+extra memory is now constant at the segment level and proportional to the pattern
+at the character level.
+
+**The state bound, corrected.** The first version of that paragraph stated the
+bound as `P × T` (pattern segments × subject segments). That is **false as an
+absolute bound**, and the same instrumentation that disproved the memo disproved
+it: with `P = 1` and `T = 77` — a lone `**` against 77 segments — the loop visits
+**78** states, entering once to read the `**` and then once per following
+position. `78 > 77`. The proven bound is **`(P + 1) × (T + 1)`**, from a
+potential-function argument now recorded on `_segments_match`
+(`Φ = (T − mark)(P + 1) + (P − pi)`, lowered by at least one by every branch, from
+`T(P + 1) + P`): at most 257 × 257 = 66,049 states under the caps, with the
+measured worst at 16,512. Asymptotically the cost is still **`O(P × T)`**, since
+`(P + 1)(T + 1) = PT + P + T + 1` — so the complexity claim stands while the
+finite bound is now one that is actually true for every valid input. The
+deterministic test asserts the proven bound over the state-space edges (`P = 0`,
+`T = 0`, `P = T = 1`, only `**`, trailing `**`, empty subject, one pattern segment
+against a long subject, the terminal transition) and pins the `P = 1, T = 77`
+counterexample so the naive form cannot creep back. The benchmark prints
+`(P + 1)(T + 1)`, not `P × T`.
+
+Reaching the measured worst case needs a hand-written pattern carrying 128 `**`
+segments and 128 `?` segments; a realistic policy is microseconds.
+
+**Correctness was not taken on trust.** Both rewritten levels were differentially
+tested against a deliberately exponential brute-force reference: 42,315
+character-level cases and 86,831 segment-level cases, exhaustive over small
+alphabets, **0 mismatches**. That differential test is now a permanent test, as
+is a wall-clock ceiling on every adversarial shape — the ceiling the old
+implementation fails by ~7×, so the defect cannot return unnoticed.
+
+**Second finding: lone surrogates.** A pattern written with a JSON `\uD800`
+escape produced a Python string containing a lone surrogate. It was accepted,
+hashed into the digest, and could never match a path decoded from UTF-8 — a rule
+that silently matches nothing, which is the exact failure mode this format
+refuses everywhere else. Lone surrogates are now refused in patterns **and** in
+subjects (code `lone_surrogate`), with a located error. Real characters above
+U+FFFF, including those written as a surrogate *pair*, are unaffected.
+
+**Malformed UTF-8 was already correct, and is now pinned.** Every malformed
+encoding tried — lone continuation byte, truncated sequence, overlong encoding,
+CESU-8 surrogate, invalid start byte, truncation at EOF — surfaces as a
+`PolicyParseError` naming the byte offset, and 3000 fuzzed byte strings produced
+no other exception type. `load_policy` indexes `raw[exc.start]`, so the fuzz
+also covers the possibility of an out-of-range offset. A 300-case fuzz test and
+a parameterised offset test are now in the suite.
+
+**Cost regression fixed while reviewing.** The surrogate check was first written
+as a per-character Python loop, which added ~1.4 ms to every subject validation
+at the length cap. Both character checks (controls and surrogates) are now one
+compiled regex scan, which is what it should have been: subject validation at the
+cap is back to ~0.09 ms total. A Python-level loop over a 4096-character subject
+costs more than the match it guards.
+
+**Documentation corrected.** `PathPattern` claimed "total matching semantics",
+which was false — matching raises on a subject it cannot canonicalise, which is
+the point. The grammar doc now says matching is total over *canonical* subjects
+and refuses the rest. `docs/policy.md` gained §4.3 (cost), a lone-surrogate row
+in the refusal table, and an explicit statement that Unicode normalisation is
+**not** applied: NFC and NFD spellings are different rules, so a rule copied from
+a normalising editor will not match a differently-encoded path. That behaviour
+was previously undocumented, which made it a trap rather than a decision.
+
+---
+
 **V4 DESIGN READY FOR REVIEW — NO IMPLEMENTATION, NO COMMIT, NO PUSH.**
 
 **V4 PHASE 0 READY FOR SECURITY REVIEW — NOT COMMITTED, NOT PUSHED.**
+
+**V4 PHASE 1 POLICY V1 READY FOR REVIEW — NOT COMMITTED, NOT PUSHED.**
+
+**V4 PHASE 1 FINAL SECURITY REVIEW READY — NOT COMMITTED, NOT PUSHED.**

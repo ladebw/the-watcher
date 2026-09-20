@@ -370,6 +370,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getcwd(),
         help="workspace to test Landlock reach against (default: cwd)",
     )
+
+    # -- policy ----------------------------------------------------------
+    # Policy V1 is a document format, not a runtime control. These subcommands
+    # validate and digest a document; nothing here is wired into `watcher run`,
+    # because no Policy V1 field is enforced yet and implying otherwise is the
+    # one thing this project must never do.
+    policy = subparsers.add_parser(
+        "policy",
+        help="validate or digest a Policy V1 document",
+        description=(
+            "Work with Policy V1 documents (JSON). Validation is strict: "
+            "unknown fields, duplicate keys, non-finite numbers and type "
+            "mismatches are refused rather than coerced."
+        ),
+    )
+    policy_commands = policy.add_subparsers(
+        dest="policy_command", required=True, metavar="{validate,digest}"
+    )
+
+    policy_validate = policy_commands.add_parser(
+        "validate",
+        help="validate a Policy V1 document",
+        description="Report every problem in a Policy V1 document, or VALID.",
+    )
+    policy_validate.add_argument("file", metavar="FILE")
+
+    policy_digest = policy_commands.add_parser(
+        "digest",
+        help="print the canonical digest of a Policy V1 document",
+        description=(
+            "Print the domain-separated SHA-256 of the canonical normalised "
+            "document. Prints only the digest by default so it can be scripted."
+        ),
+    )
+    policy_digest.add_argument("file", metavar="FILE")
+    policy_digest.add_argument(
+        "--json", action="store_true", help="emit a JSON object instead of the bare digest"
+    )
     return parser
 
 
@@ -876,6 +914,57 @@ def _demo_v2() -> int:
     return 0 if daemon.verify().valid else 1
 
 
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Validate or digest a Policy V1 document.
+
+    Exit codes follow the existing convention: 0 for success, 2 for a
+    configuration error the operator has to fix. A validation failure prints one
+    line per problem, each starting with the field path, so the output can be
+    read at a glance and parsed without prose matching.
+    """
+    from .exceptions import PolicyParseError, PolicyValidationError
+    from .policy_v1 import load_policy
+
+    command = getattr(args, "policy_command", None)
+    path = args.file
+
+    try:
+        policy = load_policy(path)
+    except PolicyParseError as exc:
+        print(f"watcher policy {command}: {exc}", file=sys.stderr)
+        return 2
+    except PolicyValidationError as exc:
+        for issue in exc.issues or ():
+            print(str(issue), file=sys.stderr)
+        if not exc.issues:
+            print(f"watcher policy {command}: {exc.summary}", file=sys.stderr)
+        return 2
+
+    if command == "validate":
+        print("VALID Policy V1")
+        return 0
+
+    if command == "digest":
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "version": policy.version,
+                        "name": policy.name,
+                        "document_digest": policy.document_digest,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(policy.document_digest)
+        return 0
+
+    print(f"watcher policy: unknown subcommand {command!r}", file=sys.stderr)
+    return 2
+
+
 def main(argv: "Sequence[str] | None" = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -890,6 +979,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         return cmd_demo(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "policy":
+        return cmd_policy(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2
