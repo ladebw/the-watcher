@@ -6,6 +6,9 @@ catch a single base class without depending on internals.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Sequence
+
 __all__ = [
     "WatcherError",
     "CanonicalizationError",
@@ -13,6 +16,9 @@ __all__ = [
     "TraceVerificationError",
     "TraceSealedError",
     "PolicyError",
+    "PolicyIssue",
+    "PolicyParseError",
+    "PolicyValidationError",
     "TripwireViolation",
     "SessionError",
     "SessionKilledError",
@@ -67,6 +73,53 @@ class TraceSealedError(TraceError):
 
 class PolicyError(WatcherError):
     """A policy is invalid or cannot be applied."""
+
+
+@dataclass(frozen=True)
+class PolicyIssue:
+    """One reason a policy document was rejected.
+
+    ``path`` locates the problem inside the document in the same dotted form a
+    reader sees in the JSON - ``filesystem.alow``, ``on_violation.tripwire``,
+    ``resources.pids`` - so an error message points at the exact line a person
+    has to edit rather than at the document as a whole.
+
+    ``code`` is a stable machine-readable identifier so tooling can branch on
+    the *kind* of problem without matching on prose.
+    """
+
+    path: str
+    message: str
+    code: str = "invalid"
+
+    def __str__(self) -> str:
+        return f"{self.path}: {self.message}" if self.path else self.message
+
+
+class PolicyParseError(PolicyError):
+    """A policy document could not be read as JSON at all.
+
+    Separated from :class:`PolicyValidationError` because the two need different
+    responses: a parse failure means "this is not a JSON document" (or not the
+    encoding and size limits the loader accepts), while a validation failure
+    means "this is JSON, and here are the exact fields that are wrong".
+    """
+
+
+class PolicyValidationError(PolicyError):
+    """A policy document parsed but is not a valid document.
+
+    Carries every issue found rather than only the first, so one review pass
+    surfaces the whole list instead of a fix-and-retry loop.
+    """
+
+    def __init__(
+        self, summary: str = "policy document is not valid", issues: "Sequence[PolicyIssue] | None" = None
+    ) -> None:
+        self.summary = summary
+        self.issues: tuple[PolicyIssue, ...] = tuple(issues or ())
+        detail = "; ".join(str(issue) for issue in self.issues)
+        super().__init__(f"{summary}: {detail}" if detail else summary)
 
 
 class TripwireViolation(WatcherError):

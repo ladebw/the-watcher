@@ -77,6 +77,7 @@ def test_license_is_mit():
     "relative",
     [
         ".gitignore",
+        "public/logo.svg",
         "public/the-watcher-logo.png",
         "diagnostics/README.md",
         "benchmarks/benchmark_v2.py",

@@ -594,6 +594,26 @@ class PoEWatcher:
         meta: Mapping[str, Any],
         evaluation: Evaluation,
     ) -> PoEEvent:
+        # Policy evidence is assembled from two things the supervisor owns: the
+        # policy in force, and the verdict it has just produced. Nothing here is
+        # taken from ``meta``, which is the workload's account of itself. The
+        # merge happens last so a client-supplied key of the same name cannot
+        # displace it.
+        policy_evidence = {**self._policy.evidence(), **dict(evaluation.evidence)}
+        metadata = {
+            **meta,
+            "rule": evaluation.rule,
+            "attempted_event_type": kind,
+            "attempted_action": action,
+            # Which facts the verdict rested on, and how much each was
+            # worth. Recorded so a reader can tell a decision built on host
+            # observation from one built on the workload's own account of
+            # itself.
+            "fact_authority": dict(evaluation.facts),
+        }
+        if policy_evidence:
+            metadata["policy_evidence"] = policy_evidence
+
         decision_event = self._recorder.record(
             EventType.POLICY_DECISION,
             action=action,
@@ -601,15 +621,13 @@ class PoEWatcher:
             decision=evaluation.decision,
             risk=evaluation.risk,
             reason=evaluation.reason,
-            metadata={
-                **meta,
-                "rule": evaluation.rule,
-                "attempted_event_type": kind,
-                "attempted_action": action,
-            },
+            metadata=metadata,
         )
 
         if evaluation.decision is Decision.DENY:
+            denied_metadata: dict[str, Any] = {**meta, "rule": evaluation.rule}
+            if policy_evidence:
+                denied_metadata["policy_evidence"] = policy_evidence
             self._recorder.record(
                 EventType.DENIED_ACTION,
                 action=action,
@@ -617,7 +635,7 @@ class PoEWatcher:
                 decision=Decision.DENY,
                 risk=evaluation.risk,
                 reason=evaluation.reason,
-                metadata={**meta, "rule": evaluation.rule},
+                metadata=denied_metadata,
             )
         return decision_event
 

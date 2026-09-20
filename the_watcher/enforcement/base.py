@@ -38,6 +38,8 @@ __all__ = [
     "EnforcementEvidence",
     "TerminationOutcome",
     "SandboxSpec",
+    "ContainmentIdentity",
+    "SurvivorScan",
     "ContainmentUnit",
     "Enforcer",
     "select_backend",
@@ -223,6 +225,91 @@ class SandboxSpec:
         return tuple(dict.fromkeys(self.profile.filesystem.allow_write))
 
 
+@dataclass(frozen=True)
+class ContainmentIdentity:
+    """What identifies a containment unit's processes.
+
+    Captured **once**, from the running sandbox process at launch, and never
+    overwritten afterwards. That is the whole point: an identity a workload can
+    erase simply by exiting is not an identity, and the previous code allowed a
+    read of a dead pid to blank the unit's namespaces, after which "is the
+    sandbox empty?" answered yes for a sandbox that still had processes in it.
+
+    ``*_start_time`` values are the ``/proc/<pid>/stat`` start ticks observed at
+    launch. They are the standard PID-reuse guard, so a recycled pid cannot be
+    mistaken for the unit's ancestor.
+    """
+
+    launcher_pid: "int | None" = None
+    launcher_start_time: "int | None" = None
+    sandbox_pid: "int | None" = None
+    sandbox_start_time: "int | None" = None
+    namespaces: NamespaceIds = field(default_factory=lambda: NamespaceIds(values={}))
+    #: The unit's **own** cgroup, and only that. Membership of a shared or
+    #: ambient cgroup (a systemd user slice, or ``/`` under a cgroup namespace)
+    #: identifies the host, not the unit, and must never be recorded here: it
+    #: matches unrelated system processes and reports them as survivors. Left as
+    #: ``None`` until a backend creates a per-unit cgroup.
+    cgroup: "str | None" = None
+    recorded_at: "int | None" = None
+
+    @property
+    def known(self) -> bool:
+        """Whether anything at all identifies this unit.
+
+        When this is ``False`` the unit cannot be verified empty and every
+        check must fail closed rather than report a reassuring answer.
+        """
+        return bool(self.namespaces.values) or self.launcher_pid is not None
+
+    @property
+    def ancestry_roots(self) -> "dict[int, int | None]":
+        roots: dict[int, int | None] = {}
+        if self.launcher_pid:
+            roots[self.launcher_pid] = self.launcher_start_time
+        if self.sandbox_pid:
+            roots[self.sandbox_pid] = self.sandbox_start_time
+        return roots
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "launcher_pid": self.launcher_pid,
+            "launcher_start_time": self.launcher_start_time,
+            "sandbox_pid": self.sandbox_pid,
+            "sandbox_start_time": self.sandbox_start_time,
+            "namespaces": self.namespaces.to_dict(),
+            "cgroup": self.cgroup,
+            "recorded_at": self.recorded_at,
+            "known": self.known,
+        }
+
+
+@dataclass(frozen=True)
+class SurvivorScan:
+    """The result of asking whether any process of a unit is still alive.
+
+    ``empty`` is deliberately conservative: it is ``True`` only when the unit
+    had an identity to check against *and* every independent layer of the scan
+    found nothing. ``identity_known`` is reported separately so a caller can
+    distinguish "proved empty" from "could not tell".
+    """
+
+    empty: bool
+    survivors: tuple[int, ...] = ()
+    identity_known: bool = False
+    layers: Mapping[str, Any] = field(default_factory=dict)
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "empty": self.empty,
+            "survivors": list(self.survivors),
+            "identity_known": self.identity_known,
+            "layers": {str(k): v for k, v in self.layers.items()},
+            "note": self.note,
+        }
+
+
 @dataclass
 class ContainmentUnit:
     """A launched containment unit and everything needed to audit it."""
@@ -239,6 +326,8 @@ class ContainmentUnit:
     started_at: "int | None" = None
     evidence: "EnforcementEvidence | None" = None
     termination: "TerminationOutcome | None" = None
+    #: Launch-time identity. Written once by the backend and never erased.
+    identity: "ContainmentIdentity | None" = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -251,7 +340,14 @@ class ContainmentUnit:
 
     @property
     def user_namespace(self) -> "str | None":
-        """The namespace that identifies this unit's processes."""
+        """The namespace that identifies this unit's processes.
+
+        Prefers the recorded launch-time identity over the mutable
+        ``namespaces`` field, so a later observation can never make the unit
+        look like a different (or no) unit.
+        """
+        if self.identity is not None and self.identity.namespaces.values:
+            return self.identity.namespaces.user or self.identity.namespaces.pid
         return self.namespaces.user or self.namespaces.pid
 
     def refresh_namespaces(self) -> None:
@@ -268,6 +364,7 @@ class ContainmentUnit:
             "host_pid": self.host_pid,
             "state": self.state.value,
             "namespaces": self.namespaces.to_dict(),
+            "identity": self.identity.to_dict() if self.identity else None,
             "control_dir_inner": self.control_dir_inner,
             "workspace_inner": self.workspace_inner,
             "started_at": self.started_at,
@@ -335,18 +432,58 @@ class Enforcer(abc.ABC):
     def terminate(self, unit: ContainmentUnit, grace: float = 2.0) -> TerminationOutcome:
         """Destroy the whole containment unit."""
 
-    def verify_empty(self, unit: ContainmentUnit) -> tuple[bool, list[int]]:
-        """Return ``(is_empty, surviving_pids)`` using trusted-side /proc.
+    def scan_survivors(self, unit: ContainmentUnit) -> SurvivorScan:
+        """Ask whether any process of ``unit`` is still alive, and prove it.
 
-        Default implementation keys on the unit's user/pid namespace, which is
-        what makes a sandbox identifiable from outside. Backends may override.
+        The default implementation is intentionally the *weakest* one that is
+        still honest: it can only see the single user/pid namespace inode. It
+        fails closed in both directions that matter:
+
+        * an unknown identity is **not** reported as empty;
+        * an unreadable namespace is treated as "not empty", never as "gone".
+
+        Backends with more evidence (ancestry, cgroup membership, several
+        namespaces) override this and combine the layers.
         """
-        namespace = unit.user_namespace
+        identity = unit.identity
+        namespaces = (
+            identity.namespaces if identity is not None and identity.namespaces.values
+            else unit.namespaces
+        )
+        kind = "user" if namespaces.user else "pid"
+        namespace = namespaces.user or namespaces.pid
+
+        layers: dict[str, Any] = {"namespace_kind": kind if namespace else None}
         if not namespace:
-            return False, []
-        kind = "user" if unit.namespaces.user else "pid"
+            return SurvivorScan(
+                empty=False,
+                identity_known=False,
+                layers=layers,
+                note=(
+                    "the unit has no recorded namespace identity, so it cannot "
+                    "be verified empty; treating it as not empty"
+                ),
+            )
+
         survivors = find_processes_in_namespace(namespace, kind=kind)
-        return (not survivors), survivors
+        layers["namespace"] = namespace
+        layers["namespace_survivors"] = list(survivors)
+        return SurvivorScan(
+            empty=not survivors,
+            survivors=tuple(survivors),
+            identity_known=True,
+            layers=layers,
+        )
+
+    def verify_empty(self, unit: ContainmentUnit) -> tuple[bool, list[int]]:
+        """Return ``(is_empty, surviving_pids)``.
+
+        ``is_empty`` is ``True`` only when the unit's identity was known and no
+        layer of the scan found a process. An unknown identity fails closed.
+        """
+        scan = self.scan_survivors(unit)
+        unit.metadata["survivor_scan"] = scan.to_dict()
+        return scan.empty, list(scan.survivors)
 
     # -- helpers ---------------------------------------------------------
 

@@ -42,6 +42,7 @@ from ..base import (
     SandboxSpec,
     TerminationOutcome,
 )
+from ..declared import require_honourable
 from ..procfs import read_cgroup
 
 __all__ = ["DockerEnforcer"]
@@ -77,6 +78,14 @@ class DockerEnforcer(Enforcer):
     def prepare(self, profile, spec: "SandboxSpec | None" = None) -> None:
         self.require_available()
         profile.validate()
+        # This backend applies a much smaller part of a profile than the
+        # namespace backend does. A setting it cannot honour must stop the
+        # session here rather than appear in the digest as enforced.
+        require_honourable(
+            profile,
+            self.backend_name,
+            allow_reduced_protection=profile.allow_reduced_protection,
+        )
 
         if profile.allow_privileged:
             raise ContainmentRefused("privileged containers are never allowed")

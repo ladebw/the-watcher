@@ -19,10 +19,12 @@ from typing import Any
 
 __all__ = [
     "NamespaceIds",
+    "ProcRecord",
     "read_status",
     "read_namespaces",
     "process_ids",
     "process_state",
+    "process_start_time",
     "caught_signals",
     "catches_signal",
     "find_processes_in_namespace",
@@ -32,6 +34,8 @@ __all__ = [
     "filesystem_type",
     "read_network_interfaces",
     "read_network_routes",
+    "snapshot",
+    "descendants_of",
 ]
 
 NS_KINDS = ("cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "time", "user", "uts")
@@ -317,3 +321,155 @@ def describe_process(pid: int) -> dict[str, Any]:
         "seccomp": status.get("Seccomp"),
         "command": read_cmdline(pid, 160),
     }
+
+
+# ---------------------------------------------------------------------------
+# Coherent /proc snapshots and ancestry
+# ---------------------------------------------------------------------------
+#
+# Deciding whether a containment unit is really empty needs more than one
+# namespace lookup. A process can create *child* namespaces (a nested user or
+# PID namespace) and would then carry different inode values from the unit it
+# still belongs to, so an identity keyed on a single inode can be evaded. These
+# helpers let a backend combine several independent views of the same instant.
+
+
+def _stat_fields(pid: int) -> "list[str] | None":
+    """Return the ``/proc/<pid>/stat`` fields after the command name."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    # "<pid> (<comm>) <state> ..."; comm may contain spaces and parentheses,
+    # so split after the final ')'.
+    close = data.rfind(")")
+    if close == -1:
+        return None
+    return data[close + 2 :].split()
+
+
+def process_start_time(pid: int) -> "int | None":
+    """``starttime`` from ``/proc/<pid>/stat``, in clock ticks.
+
+    This is the standard PID-reuse guard: a pid is only the same process if its
+    start time matches too.
+    """
+    fields = _stat_fields(pid)
+    if not fields or len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def read_ppid(pid: int) -> "int | None":
+    """Parent pid from ``/proc/<pid>/stat``."""
+    fields = _stat_fields(pid)
+    if not fields or len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class ProcRecord:
+    """One process as observed in a single coherent pass over ``/proc``."""
+
+    pid: int
+    ppid: int
+    state: str
+    start_time: "int | None"
+    user_ns: "str | None"
+    pid_ns: "str | None"
+    cgroup: "str | None"
+
+    @property
+    def live(self) -> bool:
+        """A zombie has released its resources and cannot execute again."""
+        return self.state != "Z"
+
+
+def snapshot(exclude: "set[int] | None" = None) -> list[ProcRecord]:
+    """Read every visible process once, as a consistent-ish view.
+
+    ``/proc`` is not a transactional database, so this is a *sampling*: each
+    record is internally coherent (its stat line and namespace links were read
+    from the same pid), which is what the scan below needs. A process that
+    exits mid-scan simply produces a partial record and is treated as gone.
+    """
+    skip = exclude or set()
+    records: list[ProcRecord] = []
+    for pid in process_ids():
+        if pid in skip:
+            continue
+        fields = _stat_fields(pid)
+        if not fields:
+            continue
+        try:
+            state = fields[0]
+            ppid = int(fields[1])
+            start_time = int(fields[19]) if len(fields) > 19 else None
+        except (IndexError, ValueError):
+            continue
+        records.append(
+            ProcRecord(
+                pid=pid,
+                ppid=ppid,
+                state=state,
+                start_time=start_time,
+                user_ns=namespace_inode(pid, "user"),
+                pid_ns=namespace_inode(pid, "pid"),
+                cgroup=read_cgroup(pid),
+            )
+        )
+    return records
+
+
+def descendants_of(
+    roots: "dict[int, int | None]",
+    records: "list[ProcRecord]",
+) -> list[int]:
+    """Live processes descended from ``roots``.
+
+    ``roots`` maps a root pid to the ``starttime`` observed when that root was
+    recorded. The start time is re-checked against the snapshot, so a pid that
+    has been recycled by an unrelated process is *not* treated as the unit's
+    ancestor - which would otherwise turn a reused pid into a phantom survivor.
+
+    Within a PID namespace an orphan re-parents to that namespace's init rather
+    than to host init, so the ancestry chain of a sandboxed process normally
+    still reaches the unit.
+    """
+    if not roots:
+        return []
+    by_pid = {record.pid: record for record in records}
+    confirmed = {
+        pid
+        for pid, start in roots.items()
+        if pid in by_pid
+        and by_pid[pid].live
+        and (start is None or by_pid[pid].start_time == start)
+    }
+    if not confirmed:
+        return []
+
+    children: dict[int, list[int]] = {}
+    for record in records:
+        children.setdefault(record.ppid, []).append(record.pid)
+
+    found: set[int] = set()
+    queue = [pid for root in confirmed for pid in children.get(root, [])]
+    while queue:
+        current = queue.pop()
+        if current in found:
+            continue
+        record = by_pid.get(current)
+        if record is None or not record.live:
+            continue
+        found.add(current)
+        queue.extend(children.get(current, []))
+    return sorted(found)

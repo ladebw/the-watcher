@@ -155,6 +155,11 @@ class IpcServer:
         self._clock = clock or time.time
 
         self._stopping = threading.Event()
+        #: Set at the end of :meth:`drain`, once no further request can be
+        #: admitted. A worker keys its read loop off *this* rather than
+        #: ``_stopping``: during a drain a request is refused, not dropped, so
+        #: the connection must stay answerable until the drain is over.
+        self._drained = threading.Event()
         self._threads_lock = threading.Lock()
         #: Guards the authoritative-writer count. Shares the thread lock so a
         #: state change and a writer claim cannot interleave.
@@ -163,6 +168,16 @@ class IpcServer:
         #: Handlers currently inside ``dispatch``. Non-zero means an event may
         #: still be appended, so sealing is not yet safe.
         self._writers = 0
+        #: Response frames currently being written, including ``NOT_READY``
+        #: refusals. This is deliberately *not* the same counter as ``_writers``:
+        #: a refusal dispatched nothing, so it holds no writer claim, but its
+        #: frame is on the wire and tearing the transport down mid-send
+        #: truncates it. Transport teardown waits for this to reach zero.
+        self._responses = 0
+        #: Set by the drain once it has stopped waiting for writers, so that no
+        #: new response claim can be taken between the final check and the
+        #: teardown. Without it, a refusal could begin in that gap and be cut.
+        self._claims_closed = False
         self._connections: dict[str, IpcConnection] = {}
         self._contexts: dict[str, ClientContext] = {}
         self._accept_thread: "threading.Thread | None" = None
@@ -202,6 +217,19 @@ class IpcServer:
         """Handlers currently mid-append. Must be zero before sealing."""
         with self._writers_cv:
             return self._writers
+
+    @property
+    def active_responses(self) -> int:
+        """Response frames currently being written, refusals included.
+
+        Every admitted request holds one of these for its whole
+        request/response cycle, and every ``NOT_READY`` refusal holds one for
+        the duration of its send. The drain waits for this to reach zero before
+        it closes any transport, which is what stops teardown from racing a
+        reply that is halfway out.
+        """
+        with self._writers_cv:
+            return self._responses
 
     @property
     def connection_count(self) -> int:
@@ -261,15 +289,48 @@ class IpcServer:
         1. move to ``DRAINING`` under the writer condition, so no *new* handler
            can start and therefore no new append can begin;
         2. wake and join the accept loop, so no new connection can arrive;
-        3. close the accepted transports, which unblocks a worker parked in a
-           read;
-        4. wait for the workers to exit — their teardown is what records
+        3. wait for the in-flight writers to finish — **before** any transport is
+           touched, so a request that arrives during the drain is still answered
+           with a deterministic refusal rather than racing the teardown;
+        4. close the refusal window and wait for the responses already in flight
+           — including ``NOT_READY`` frames — to be written, so teardown can
+           never truncate a reply;
+        5. release the parked workers and close the accepted transports, which
+           unblocks a worker sitting in a read;
+        6. wait for the workers to exit — their teardown is what records
            ``client_disconnected``, and a live worker could still be doing it;
-        5. wait for the in-flight writer count to reach zero.
+        7. wait once more for the in-flight writer count to reach zero.
 
-        Steps 4 and 5 are both required: a worker can be alive without writing,
+        The cutover, stated as rules rather than as a sequence, because these
+        are the properties a caller depends on:
+
+        * while the response-claim window is open, a request that arrives on an
+          already-established connection while DRAINING receives a complete
+          ``NOT_READY`` frame, and is never dispatched;
+        * the window is closed atomically under the writer condition, so once it
+          is closed no further response claim is admitted - a frame cannot begin
+          in the gap between the final check and the teardown;
+        * teardown then waits for the responses already claimed to be written,
+          bounded by the drain deadline, so an in-flight reply is never
+          truncated;
+        * a request is never dispatched after ``DRAINING`` begins: admission is
+          decided in exactly one place, ``_begin_write``, under the same
+          condition that performs the transition, so a request racing it has one
+          outcome or the other and never both.
+
+        Steps 4 and 6 are both required: a worker can be alive without writing,
         and a writer can be mid-append on a worker that is about to exit. Only
         when both are clear is it safe to seal the trace.
+
+        Step 3 preceding step 5 is what makes the shutdown race-free. Closing the
+        transports is what unblocks a worker parked in a read, but doing it at
+        the instant draining began - while a writer was still mid-append -
+        destroyed the very connection a client needs in order to be refused, so a
+        request arriving in that window raced the teardown and observed a
+        connection reset instead of ``NOT_READY``. A connection that is still
+        open can refuse deterministically; one that has been closed can only
+        drop. Step 4 closes the same hole for refusals: those frames are on the
+        wire too, and they hold a response claim so teardown must wait for them.
 
         Bounded and non-raising: an unclean drain is reported through
         :class:`DrainOutcome` so that :meth:`stop` can turn it into an explicit
@@ -281,6 +342,7 @@ class IpcServer:
 
         with self._writers_cv:
             if self._state is ServerState.STOPPED:
+                self._drained.set()
                 return DrainOutcome(True, False, 0, (), 0.0)
             self._state = ServerState.DRAINING
             self._stopping.set()
@@ -300,6 +362,38 @@ class IpcServer:
             self._workers.clear()
             connections.extend(self._connections.values())
             self._connections.clear()
+
+        # Wait for the in-flight writers before closing anything, so that a
+        # request arriving during the drain is answered instead of reset. The
+        # condition releases the lock while waiting, so ``_begin_write`` can
+        # still admit/refuse in parallel - and refuses, because the state is
+        # already DRAINING.
+        try:
+            with self._writers_cv:
+                while self._writers > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._writers_cv.wait(min(remaining, 0.25))
+
+            # Writers are done, so the window in which a request can be *refused*
+            # is about to close. Shut it under the same lock, and then wait for
+            # the responses already being written - refusals included - to
+            # finish. Closing the claim window before the final check is what
+            # removes the last gap: a claim can no longer be taken between
+            # observing zero and tearing the transports down.
+            with self._writers_cv:
+                self._claims_closed = True
+                while self._responses > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._writers_cv.wait(min(remaining, 0.25))
+        finally:
+            # Whatever happened above, no further request will be answered, so
+            # the parked workers must be released rather than left waiting for
+            # work that can never be admitted.
+            self._drained.set()
 
         for connection in connections:
             try:
@@ -449,7 +543,20 @@ class IpcServer:
                 return
 
             reason = "client_closed"
-            while not self._stopping.is_set():
+            # This loop deliberately keys off ``_drained`` rather than
+            # ``_stopping``.
+            #
+            # Draining is a state in which requests are *refused*, not a state
+            # in which the connection vanishes. Exiting here as soon as
+            # ``_stopping`` was set meant a request that arrived moments after
+            # the drain began was dropped along with the socket instead of being
+            # answered - and whether a client saw the ``NOT_READY`` refusal or a
+            # connection reset depended purely on where this worker happened to
+            # be when the transition landed. Staying parked until the drain is
+            # actually over makes the outcome deterministic: every request that
+            # arrives while the connection is open reaches ``_begin_write`` and
+            # receives exactly one answer.
+            while not self._drained.is_set():
                 if not connection.poll(self._limits.idle_poll):
                     continue
                 self._serve_one(connection, context)
@@ -602,45 +709,51 @@ class IpcServer:
         payload = message.get("payload") or {}
         if not self._begin_write():
             # Draining. Refusing here is what guarantees that no *new*
-            # authoritative write can start once shutdown has begun.
+            # authoritative write can start once shutdown has begun. The reply
+            # goes out under its own in-flight claim so the drain cannot cut it.
+            self._send_refusal(connection, request_id)
+            return
+
+        # The writer claim is held for the whole request/response cycle, not
+        # merely across ``dispatch``. Releasing it before the reply was written
+        # let the drain observe "no active writers", close the transport, and
+        # destroy the reply to a request that had legitimately been admitted -
+        # the other half of the shutdown race, landing on a client that did
+        # nothing wrong. "Admitted before draining" must mean "completes
+        # normally", which is only true if the claim outlives the send.
+        try:
             try:
+                result = self._handler.dispatch(message_type, payload, context)
+            except ProtocolError as exc:
+                connection.send(
+                    build_error(request_id, exc.code, "request rejected"), self._limits
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                # Never leak internals to the client; the daemon logs internally.
+                self._call_hook(
+                    "on_handler_error",
+                    type(exc).__name__,
+                    sanitize_text(str(exc)),
+                    context,
+                )
                 connection.send(
                     build_error(
-                        request_id,
-                        ErrorCode.NOT_READY,
-                        "server is shutting down",
+                        request_id, ErrorCode.INTERNAL_ERROR, "internal error"
                     ),
                     self._limits,
                 )
-            except Exception:  # noqa: BLE001
-                pass
-            return
+                return
 
-        try:
-            result = self._handler.dispatch(message_type, payload, context)
-        except ProtocolError as exc:
+            context.requests_served += 1
             connection.send(
-                build_error(request_id, exc.code, "request rejected"), self._limits
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            # Never leak internals to the client; the daemon logs internally.
-            self._call_hook(
-                "on_handler_error", type(exc).__name__, sanitize_text(str(exc)), context
-            )
-            connection.send(
-                build_error(request_id, ErrorCode.INTERNAL_ERROR, "internal error"),
+                build_response(
+                    request_id, result if isinstance(result, Mapping) else {}
+                ),
                 self._limits,
             )
-            return
         finally:
             self._end_write()
-
-        context.requests_served += 1
-        connection.send(
-            build_response(request_id, result if isinstance(result, Mapping) else {}),
-            self._limits,
-        )
 
     def _begin_write(self) -> bool:
         """Claim the right to run one authoritative handler, or refuse.
@@ -649,17 +762,57 @@ class IpcServer:
         opposed to inferring safety from thread liveness — is what makes
         "no active authoritative writer before seal" a property the shutdown
         can actually check.
+
+        The admitted request also takes a *response* claim, because the drain
+        has to wait for the reply to be written and not merely for the handler to
+        return; otherwise it can close the transport under its own reply.
         """
         with self._writers_cv:
-            if self._state is not ServerState.RUNNING:
+            if self._state is not ServerState.RUNNING or self._claims_closed:
                 return False
             self._writers += 1
+            self._responses += 1
             return True
 
     def _end_write(self) -> None:
         with self._writers_cv:
             self._writers -= 1
+            self._responses -= 1
             self._writers_cv.notify_all()
+
+    def _send_refusal(self, connection: IpcConnection, request_id: "str | None") -> None:
+        """Write a ``NOT_READY`` refusal under an in-flight response claim.
+
+        A refusal dispatched nothing, so it takes no *writer* claim. It does
+        have to reach the client in one piece, though, and without a claim the
+        drain could observe no writers, conclude it was finished, and close the
+        transport underneath a frame that was halfway out — the same
+        client-visible reset this path exists to remove, just at a narrower
+        boundary.
+
+        If the claim window has already closed then the teardown has begun, and
+        no frame is written at all: a clean close is a better answer than a
+        truncated one.
+        """
+        with self._writers_cv:
+            if self._claims_closed:
+                return
+            self._responses += 1
+        try:
+            connection.send(
+                build_error(
+                    request_id,
+                    ErrorCode.NOT_READY,
+                    "server is shutting down",
+                ),
+                self._limits,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with self._writers_cv:
+                self._responses -= 1
+                self._writers_cv.notify_all()
 
     def _remember_request(self, context: ClientContext, request_id: "str | None") -> bool:
         """Return ``False`` for a replayed request id."""
